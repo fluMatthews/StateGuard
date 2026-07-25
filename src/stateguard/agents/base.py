@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+from stateguard.core.events import ReActStep
+from stateguard.core.models import Message
+
+
+class Agent(Protocol):
+    def start(self, prompt: str, system_prompt: str | None = None) -> None: ...
+
+    def continue_turn(self, prompt: str) -> None: ...
+
+    def step(self) -> ReActStep: ...
+
+    def inject_observation(self, content: str, metadata: dict[str, Any] | None = None) -> None: ...
+
+    def snapshot(self) -> Any: ...
+
+    def restore(self, snapshot: Any) -> None: ...
+
+    @property
+    def messages(self) -> tuple[Message, ...]: ...
+
+    @property
+    def done(self) -> bool: ...
+
+    @property
+    def final_answer(self) -> str | None: ...

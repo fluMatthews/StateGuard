@@ -1,0 +1,7 @@
+{
+  "max_worker_steps": 80,
+  "max_manager_actions_per_event": 16,
+  "max_repairs": 3,
+  "light_repair_attempts": 2,
+  "fail_open_on_abstain": true
+}
