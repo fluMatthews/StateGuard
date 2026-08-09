@@ -4,8 +4,10 @@ import unittest
 from pathlib import Path
 
 from stateguard.adapters.flow import FixedStepFlowAdapter
+from stateguard.agents.manager import StateManagerAgent
 from stateguard.agents.worker import WorkerAgent
-from stateguard.core.models import TaskSpec
+from stateguard.core.events import ReActStep
+from stateguard.core.models import AgentAction, TaskSpec
 from stateguard.harness.engine import StateGuardConfig, StateGuardHarness
 from stateguard.providers.base import ScriptedModelClient
 from stateguard.runtime.workspace import InMemoryWorkspace
@@ -13,6 +15,7 @@ from stateguard.runtime.bundle import StateGuardRuntime
 from stateguard.runtime.executors import TrustedPythonExecutor
 from stateguard.runtime.checkpoints import CheckpointManager
 from stateguard.repair.controller import RepairController, RepairDirective, RepairSession
+from stateguard.runtime.trace import TraceBuffer
 from stateguard.runtime.tools import FunctionTool, ToolRegistry
 from stateguard.state.models import (
     Conclusion,
@@ -22,6 +25,7 @@ from stateguard.state.models import (
     VariableRef,
 )
 from stateguard.state.draft import (
+    DraftStore,
     RelationFinalization,
     RelationFinalizationMode,
     StateHeader,
@@ -32,6 +36,7 @@ from stateguard.state.models import AnalyticalState
 from stateguard.state.store import StateStore
 from stateguard.validation.models import (
     AnalyticalEvidence,
+    ERROR_HINT_PROMPT,
     CleanupPlan,
     ErrorHint,
     ManagerAction,
@@ -46,7 +51,6 @@ class RepairThenCommitManager:
         self.commands = [
             ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
-                note="Initialize S1 from the query before tracing.",
                 state_header=StateHeader(
                     id="S1",
                     issue="Compute 6 * 7",
@@ -56,11 +60,9 @@ class RepairThenCommitManager:
             ),
             ManagerDecision(
                 action=ManagerAction.RESUME_WORKER,
-                note="S1 is initialized; trace the worker.",
             ),
             ManagerDecision(
                 action=ManagerAction.REPAIR,
-                note="The final arithmetic contradicts the explicit task.",
                 confidence=0.99,
                 evidence=AnalyticalEvidence(
                     confidence=0.99,
@@ -69,15 +71,15 @@ class RepairThenCommitManager:
                     suspected_step_ids=(1,),
                 ),
                 error_hint=ErrorHint(
-                    prompt="Re-check the arithmetic using an execution tool.",
+                    prompt=ERROR_HINT_PROMPT,
                     error_variable=("final_result",),
                     faulty_reasoning="The answer 41 is unsupported and conflicts with 6 * 7.",
                 ),
             ),
         ]
 
-    def start_task(self, task, state_index):
-        del task, state_index
+    def start_task(self, task):
+        del task
 
     def act(self, request):
         if self.commands:
@@ -86,25 +88,15 @@ class RepairThenCommitManager:
             "final_result",
             "S1",
             value=42,
-            value_type="int",
-            producer_state_id="S1",
-            producer_step_id=1,
         )
         if not self.state_updated:
             self.state_updated = True
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
-                note="Write the checked repaired trace before relation finalization.",
                 state_update=StateUpdate(
-                    confidence=0.99,
                     used_variables=(variable,),
                     conclusions=(
-                        Conclusion(
-                            "C1",
-                            "The result is 42.",
-                            (variable.key,),
-                            ("worker-step-1",),
-                        ),
+                        Conclusion("The result is 42."),
                     ),
                     traced_step_ids=(request.worker_step.step_id,),
                 ),
@@ -113,7 +105,6 @@ class RepairThenCommitManager:
             self.relations_finalized = True
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                note="The repaired trace confirms that S1 remains an init state.",
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.CONFIRM,
                     relations=(StateRelation(StateRelationType.INIT),),
@@ -122,7 +113,6 @@ class RepairThenCommitManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            note="The repaired answer satisfies the explicit calculation.",
             confidence=0.99,
         )
 
@@ -138,6 +128,68 @@ class SnapshotAwareRepairThenCommitManager(RepairThenCommitManager):
     def restore(self, snapshot):
         del snapshot
         self.restore_calls += 1
+
+
+class SparseRepairThenCommitManager:
+    """After repair, keep only correct supporting steps from the rewritten interval."""
+
+    def __init__(self):
+        self.observations = []
+
+    def start_task(self, task):
+        del task
+
+    def act(self, request):
+        self.observations.append(request)
+        index = len(self.observations)
+        if index == 1:
+            return ManagerDecision(
+                action=ManagerAction.OPEN_STATE,
+                state_header=StateHeader(
+                    id="S1",
+                    issue="Produce a corrected supported result",
+                    constraints=(Constraint("Use only correct rewritten evidence."),),
+                    relations=(StateRelation(StateRelationType.INIT),),
+                ),
+            )
+        if index == 2:
+            return ManagerDecision(action=ManagerAction.RESUME_WORKER)
+        if index == 3:
+            return ManagerDecision(
+                action=ManagerAction.REPAIR,
+                confidence=0.99,
+                evidence=AnalyticalEvidence(
+                    confidence=0.99,
+                    violated_constraints=("Use only correct rewritten evidence.",),
+                    evidence=("The first answer is explicitly unsupported.",),
+                    suspected_step_ids=(1,),
+                ),
+                error_hint=ErrorHint(
+                    prompt=ERROR_HINT_PROMPT,
+                    error_variable=("result",),
+                    faulty_reasoning="The first answer has no supporting execution.",
+                ),
+            )
+        if index == 4:
+            return ManagerDecision(
+                action=ManagerAction.UPDATE_STATE,
+                state_update=StateUpdate(
+                    conclusions=(Conclusion("The rewritten result is supported."),),
+                    # Step 3 is an irrelevant intermediate action inside the
+                    # repaired interval and is deliberately excluded.
+                    traced_step_ids=(2, 4, 5),
+                ),
+            )
+        if index == 5:
+            return ManagerDecision(
+                action=ManagerAction.FINALIZE_RELATIONS,
+                relation_finalization=RelationFinalization(
+                    mode=RelationFinalizationMode.CONFIRM,
+                    relations=(StateRelation(StateRelationType.INIT),),
+                    reason="The rewritten state remains the initial state.",
+                ),
+            )
+        return ManagerDecision(action=ManagerAction.COMMIT_STATE)
 
 
 class RecordingModelClient(ScriptedModelClient):
@@ -156,16 +208,14 @@ class RelationFirstManager:
     def __init__(self):
         self.observations = []
 
-    def start_task(self, task, state_index):
+    def start_task(self, task):
         del task
-        self.start_index = state_index
 
     def act(self, request):
         self.observations.append(request)
         if len(self.observations) == 1:
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
-                note="The query continues the result represented by S1.",
                 state_header=StateHeader(
                     id="S2",
                     issue="Report the prior result",
@@ -178,22 +228,18 @@ class RelationFirstManager:
         if len(self.observations) == 2:
             return ManagerDecision(
                 action=ManagerAction.RESUME_WORKER,
-                note="The relation observation is available; trace the worker.",
             )
         if len(self.observations) == 3:
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
-                note="Write the checked trace into current state before relation review.",
                 state_update=StateUpdate(
-                    confidence=0.95,
-                    conclusions=(Conclusion("C2", "The reported value is 42."),),
+                    conclusions=(Conclusion("The reported value is 42."),),
                     traced_step_ids=(1,),
                 ),
             )
         if len(self.observations) == 4:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                note="The completed trace confirms the provisional progress relation.",
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.CONFIRM,
                     relations=(StateRelation(StateRelationType.PROGRESS, "S1"),),
@@ -202,7 +248,6 @@ class RelationFirstManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            note="The worker used the selected predecessor state.",
             confidence=0.95,
         )
 
@@ -213,8 +258,8 @@ class RelationReselectManager:
     def __init__(self):
         self.observations = []
 
-    def start_task(self, task, state_index):
-        del task, state_index
+    def start_task(self, task):
+        del task
 
     def act(self, request):
         self.observations.append(request)
@@ -222,7 +267,6 @@ class RelationReselectManager:
         if index == 1:
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
-                note="The query initially appears to continue S1.",
                 state_header=StateHeader(
                     id="S3",
                     issue="Identify the actual reused result",
@@ -233,27 +277,23 @@ class RelationReselectManager:
         if index == 2:
             return ManagerDecision(
                 action=ManagerAction.RESUME_WORKER,
-                note="Trace the worker with the provisional S1 observation.",
             )
         if index == 3:
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
-                note="Write the checked actual state before validating its relation.",
                 state_update=StateUpdate(
-                    confidence=0.97,
-                    conclusions=(Conclusion("C3", "The worker actually reused S2."),),
+                    conclusions=(Conclusion("The worker actually reused S2."),),
                     traced_step_ids=(1,),
                 ),
             )
         if index == 4:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                note="The completed state explicitly contradicts provisional S1.",
                 confidence=0.97,
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.RESELECT,
                     relations=(StateRelation(StateRelationType.PROGRESS, "S2"),),
-                    reason="Shared current-state/full-store selection identifies S2.",
+                    reason="Shared current-state/compact-index selection identifies S2.",
                     conflict_evidence=(
                         "Current conclusion names and reuses S2, while provisional S1 has a different result.",
                     ),
@@ -261,7 +301,6 @@ class RelationReselectManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            note="Commit only the evidence-selected final S2 relation.",
         )
 
 
@@ -271,8 +310,8 @@ class FixedRepairSequenceManager:
     def __init__(self):
         self.observations = []
 
-    def start_task(self, task, state_index):
-        del task, state_index
+    def start_task(self, task):
+        del task
 
     def act(self, request):
         self.observations.append(request)
@@ -280,7 +319,6 @@ class FixedRepairSequenceManager:
         if index == 1:
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
-                note="Open the state before tracing.",
                 state_header=StateHeader(
                     id="S1",
                     issue="Produce a verified answer",
@@ -291,12 +329,10 @@ class FixedRepairSequenceManager:
         if index == 2:
             return ManagerDecision(
                 action=ManagerAction.RESUME_WORKER,
-                note="Let the worker produce the first answer.",
             )
         if index in {3, 4, 5}:
             return ManagerDecision(
                 action=ManagerAction.REPAIR,
-                note="The newly inspected retry still has a concrete error.",
                 confidence=0.99,
                 evidence=AnalyticalEvidence(
                     0.99,
@@ -305,14 +341,13 @@ class FixedRepairSequenceManager:
                     suspected_step_ids=(1,),
                 ),
                 error_hint=ErrorHint(
-                    "Verify the unsupported result.",
+                    ERROR_HINT_PROMPT,
                     ("answer",),
                     "The latest worker output remains unsupported.",
                 ),
             )
         return ManagerDecision(
-            action=ManagerAction.ROLLBACK_PASS,
-            note="The checked heavy retry is still wrong; restore and pass.",
+            action=ManagerAction.ABANDON_STATE,
         )
 
 
@@ -320,23 +355,20 @@ class FixedWindowManager:
     def __init__(self):
         self.observations = []
 
-    def start_task(self, task, state_index):
-        del task, state_index
+    def start_task(self, task):
+        del task
 
     def act(self, request):
         self.observations.append(request)
         if len(self.observations) == 1:
             return ManagerDecision(
                 action=ManagerAction.RESUME_WORKER,
-                note="Wait for the fixed review window before deciding state.",
             )
         if len(self.observations) == 2:
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
-                note="The completed five-step segment forms one state.",
                 state_header=StateHeader(
                     id="S1",
-                    issue="Complete the five-step segment",
                     constraints=(Constraint("Use the executed segment output."),),
                     relations=(),
                 ),
@@ -344,17 +376,15 @@ class FixedWindowManager:
         if len(self.observations) == 3:
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
-                note="Write the completed interval before selecting its relations.",
                 state_update=StateUpdate(
-                    confidence=0.95,
-                    conclusions=(Conclusion("C1", "The five-step segment completed."),),
+                    issue="Complete the five-step segment",
+                    conclusions=(Conclusion("The five-step segment completed."),),
                     traced_step_ids=(1, 2, 3, 4, 5),
                 ),
             )
         if len(self.observations) == 4:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                note="Select the relation from current state and the empty store.",
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.SELECT,
                     relations=(StateRelation(StateRelationType.INIT),),
@@ -363,18 +393,117 @@ class FixedWindowManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            note="The segment state and its selected relation are checked.",
             confidence=0.95,
         )
 
 
+class ArbitraryBoundaryManager:
+    """Choose a three-step state at a five-step mechanical review point."""
+
+    def __init__(self):
+        self.observations = []
+
+    def start_task(self, task):
+        del task
+
+    def act(self, request):
+        self.observations.append(request)
+        index = len(self.observations)
+        if index == 1:
+            return ManagerDecision(
+                action=ManagerAction.RESUME_WORKER,
+            )
+        if index == 2:
+            return ManagerDecision(
+                action=ManagerAction.OPEN_STATE,
+                state_header=StateHeader(
+                    id="S1",
+                    constraints=(Constraint("Use the selected executed prefix."),),
+                    relations=(),
+                ),
+            )
+        if index == 3:
+            return ManagerDecision(
+                action=ManagerAction.UPDATE_STATE,
+                state_update=StateUpdate(
+                    issue="Record the first completed sub-result",
+                    conclusions=(Conclusion("The first sub-result is complete."),),
+                    traced_step_ids=(1, 2, 3),
+                ),
+            )
+        if index == 4:
+            return ManagerDecision(
+                action=ManagerAction.FINALIZE_RELATIONS,
+                relation_finalization=RelationFinalization(
+                    mode=RelationFinalizationMode.SELECT,
+                    relations=(StateRelation(StateRelationType.INIT),),
+                    reason="This is the first committed analytical state.",
+                ),
+            )
+        if index == 5:
+            return ManagerDecision(
+                action=ManagerAction.COMMIT_STATE,
+            )
+        if index == 6:
+            return ManagerDecision(
+                action=ManagerAction.RESUME_WORKER,
+            )
+        return ManagerDecision(
+            action=ManagerAction.ABSTAIN,
+        )
+
+
 class CrashingManager:
-    def start_task(self, task, state_index):
-        del task, state_index
+    def start_task(self, task):
+        del task
 
     def act(self, request):
         del request
         raise RuntimeError("manager backend unavailable")
+
+
+class CountingWorkspace(InMemoryWorkspace):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.restore_calls = 0
+
+    def restore(self, snapshot):
+        self.restore_calls += 1
+        super().restore(snapshot)
+
+
+class CountingTraceBuffer(TraceBuffer):
+    def __init__(self):
+        super().__init__()
+        self.restore_calls = 0
+
+    def restore(self, snapshot):
+        self.restore_calls += 1
+        super().restore(snapshot)
+
+
+class FailingUpdateDraftStore(DraftStore):
+    def update(self, update):
+        del update
+        raise RuntimeError("injected draft update failure")
+
+
+class FailingGraph(StateRelationGraph):
+    def add_state(self, state):
+        super().add_state(state)
+        raise RuntimeError("injected graph write failure")
+
+
+class SequenceManager:
+    def __init__(self, commands):
+        self.commands = list(commands)
+
+    def start_task(self, task):
+        del task
+
+    def act(self, request):
+        del request
+        return self.commands.pop(0)
 
 
 class HarnessTest(unittest.TestCase):
@@ -444,16 +573,217 @@ class HarnessTest(unittest.TestCase):
                 [json.dumps({"type": "final", "answer": "worker-answer", "reasoning": "done"})]
             )
         )
+        workspace = CountingWorkspace()
         result = StateGuardHarness(
             worker=worker,
             manager=CrashingManager(),
-            workspace=InMemoryWorkspace(),
+            workspace=workspace,
         ).run(TaskSpec("manager-failure", "Answer with the worker."))
 
         self.assertEqual(result.final_answer, "worker-answer")
         self.assertTrue(result.degraded)
         self.assertGreaterEqual(len(result.manager_failures), 1)
         self.assertEqual(result.manager_failures[0].error_type, "RuntimeError")
+        self.assertEqual(workspace.restore_calls, 0)
+
+    def test_two_malformed_manager_outputs_cancel_intervention(self):
+        worker = WorkerAgent(
+            ScriptedModelClient(
+                [json.dumps({"type": "final", "answer": "worker-answer", "reasoning": "done"})]
+            )
+        )
+        manager = StateManagerAgent(
+            ScriptedModelClient(["not-json-once", "not-json-twice"])
+        )
+        workspace = CountingWorkspace()
+
+        result = StateGuardHarness(
+            worker=worker,
+            manager=manager,
+            workspace=workspace,
+        ).run(TaskSpec("malformed-manager", "Let the worker answer."))
+
+        self.assertEqual(result.final_answer, "worker-answer")
+        self.assertTrue(result.degraded)
+        self.assertEqual(len(manager.invocations), 2)
+        self.assertEqual(workspace.restore_calls, 0)
+
+    def test_checkpoint_can_restore_only_selected_control_components(self):
+        worker = WorkerAgent(ScriptedModelClient([]))
+        worker.start("original")
+        workspace = InMemoryWorkspace(variables={"value": 1})
+        checkpoints = CheckpointManager({"worker": worker, "workspace": workspace})
+        selected = checkpoints.capture("worker-only", components=("worker",))
+        worker.inject_observation("temporary")
+        workspace.variables["value"] = 2
+
+        checkpoints.restore(selected)
+
+        self.assertFalse(any(message.content == "temporary" for message in worker.messages))
+        self.assertEqual(workspace.variables["value"], 2)
+
+    def test_definite_preflight_error_gets_one_manager_correction(self):
+        worker = WorkerAgent(
+            ScriptedModelClient(
+                [json.dumps({"type": "final", "answer": "done", "reasoning": "done"})]
+            )
+        )
+        manager = SequenceManager(
+            [
+                ManagerDecision(
+                    action=ManagerAction.UPDATE_STATE,
+                    state_update=StateUpdate(),
+                ),
+                ManagerDecision(action=ManagerAction.RESUME_WORKER),
+                ManagerDecision(action=ManagerAction.ABSTAIN),
+            ]
+        )
+        workspace = CountingWorkspace()
+
+        result = StateGuardHarness(
+            worker=worker,
+            manager=manager,
+            workspace=workspace,
+        ).run(TaskSpec("preflight-retry", "Finish the task."))
+
+        self.assertEqual(result.final_answer, "done")
+        self.assertFalse(result.degraded)
+        self.assertEqual(result.manager_actions, 3)
+        self.assertEqual(workspace.restore_calls, 0)
+
+    def test_exception_at_unit_end_releases_all_lifecycle_checkpoints(self):
+        worker = WorkerAgent(
+            ScriptedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "reasoning": "continue",
+                            "tool": "noop",
+                            "arguments": {"value": 1},
+                        }
+                    )
+                ]
+            ),
+            ToolRegistry(
+                [FunctionTool("noop", "Return a value.", lambda value: value)]
+            ),
+        )
+        harness = StateGuardHarness(
+            worker=worker,
+            manager=SequenceManager([ManagerDecision(action=ManagerAction.RESUME_WORKER)]),
+            workspace=InMemoryWorkspace(),
+            config=StateGuardConfig(max_worker_steps=1),
+        )
+
+        with self.assertRaises(RuntimeError):
+            harness.run(TaskSpec("checkpoint-finally", "Keep working."))
+
+        self.assertEqual(harness.checkpoints.retained_count, 0)
+
+    def test_update_failure_restores_draft_and_trace_without_workspace(self):
+        worker = WorkerAgent(
+            ScriptedModelClient(
+                [json.dumps({"type": "final", "answer": "done", "reasoning": "done"})]
+            )
+        )
+        manager = SequenceManager(
+            [
+                ManagerDecision(
+                    action=ManagerAction.OPEN_STATE,
+                    state_header=StateHeader(
+                        id="S1",
+                        issue="Record the result",
+                        constraints=(Constraint("Record the result."),),
+                        relations=(StateRelation(StateRelationType.INIT),),
+                    ),
+                ),
+                ManagerDecision(action=ManagerAction.RESUME_WORKER),
+                ManagerDecision(
+                    action=ManagerAction.UPDATE_STATE,
+                    state_update=StateUpdate(
+                        conclusions=(Conclusion("The worker finished."),),
+                        traced_step_ids=(1,),
+                    ),
+                ),
+            ]
+        )
+        workspace = CountingWorkspace()
+        trace = CountingTraceBuffer()
+        runtime = StateGuardRuntime.create(
+            worker=worker,
+            manager=manager,
+            workspace=workspace,
+            draft_store=FailingUpdateDraftStore(),
+            trace_buffer=trace,
+        )
+
+        result = StateGuardHarness(runtime=runtime).run(
+            TaskSpec("update-failure", "Finish and record the result.")
+        )
+
+        self.assertEqual(result.final_answer, "done")
+        self.assertTrue(result.degraded)
+        self.assertEqual(trace.restore_calls, 1)
+        self.assertEqual(workspace.restore_calls, 0)
+
+    def test_commit_failure_restores_control_plane_without_workspace(self):
+        worker = WorkerAgent(
+            ScriptedModelClient(
+                [json.dumps({"type": "final", "answer": "done", "reasoning": "done"})]
+            )
+        )
+        manager = SequenceManager(
+            [
+                ManagerDecision(
+                    action=ManagerAction.OPEN_STATE,
+                    state_header=StateHeader(
+                        id="S1",
+                        issue="Record the result",
+                        constraints=(Constraint("Record the result."),),
+                        relations=(StateRelation(StateRelationType.INIT),),
+                    ),
+                ),
+                ManagerDecision(action=ManagerAction.RESUME_WORKER),
+                ManagerDecision(
+                    action=ManagerAction.UPDATE_STATE,
+                    state_update=StateUpdate(
+                        conclusions=(Conclusion("The worker finished."),),
+                        traced_step_ids=(1,),
+                    ),
+                ),
+                ManagerDecision(
+                    action=ManagerAction.FINALIZE_RELATIONS,
+                    relation_finalization=RelationFinalization(
+                        mode=RelationFinalizationMode.CONFIRM,
+                        relations=(StateRelation(StateRelationType.INIT),),
+                        reason="This is the initial checked state.",
+                    ),
+                ),
+                ManagerDecision(action=ManagerAction.COMMIT_STATE),
+            ]
+        )
+        workspace = CountingWorkspace()
+        store = StateStore()
+        graph = FailingGraph()
+        runtime = StateGuardRuntime.create(
+            worker=worker,
+            manager=manager,
+            workspace=workspace,
+            state_store=store,
+            graph=graph,
+        )
+
+        result = StateGuardHarness(runtime=runtime).run(
+            TaskSpec("commit-failure", "Finish and record the result.")
+        )
+
+        self.assertEqual(result.final_answer, "done")
+        self.assertTrue(result.degraded)
+        self.assertEqual(len(store), 0)
+        self.assertEqual(graph.nodes, {})
+        self.assertEqual(graph.edges, [])
+        self.assertEqual(workspace.restore_calls, 0)
 
     def test_runtime_rejects_mismatched_checkpoint_components(self):
         worker = WorkerAgent(ScriptedModelClient([]))
@@ -506,6 +836,94 @@ class HarnessTest(unittest.TestCase):
             [record["status"] for record in harness.trace_buffer.history()],
             ["rejected", "accepted"],
         )
+        self.assertEqual(harness.checkpoints.retained_count, 0)
+
+    def test_trace_selection_is_contiguous_before_repair(self):
+        trace = TraceBuffer()
+        trace.start_unit("normal-state")
+        for step_id in (1, 2, 3):
+            trace.append(
+                ReActStep(
+                    step_id=step_id,
+                    action=AgentAction(
+                        kind="final",
+                        reasoning=f"step {step_id}",
+                        answer=str(step_id),
+                    ),
+                    observation=None,
+                    done=step_id == 3,
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "contiguous prefix"):
+            trace.consume((1, 3), allow_sparse=False)
+
+        self.assertEqual(
+            [record["status"] for record in trace.history()],
+            ["pending", "pending", "pending"],
+        )
+
+    def test_post_repair_state_can_commit_ordered_sparse_trace_subset(self):
+        model = ScriptedModelClient(
+            [
+                json.dumps(
+                    {"type": "final", "answer": "unsupported", "reasoning": "guess"}
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "reasoning": "produce supporting evidence",
+                        "tool": "noop",
+                        "arguments": {"value": 2},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "reasoning": "irrelevant intermediate action",
+                        "tool": "noop",
+                        "arguments": {"value": 3},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "reasoning": "verify the corrected result",
+                        "tool": "noop",
+                        "arguments": {"value": 4},
+                    }
+                ),
+                json.dumps(
+                    {"type": "final", "answer": "supported", "reasoning": "verified"}
+                ),
+            ]
+        )
+        worker = WorkerAgent(
+            model,
+            ToolRegistry(
+                [FunctionTool("noop", "Return one test value.", lambda value: value)]
+            ),
+        )
+        harness = StateGuardHarness(
+            worker=worker,
+            manager=SparseRepairThenCommitManager(),
+            workspace=InMemoryWorkspace(),
+        )
+
+        result = harness.run(
+            TaskSpec("sparse-repair-trace", "Produce a supported rewritten answer.")
+        )
+
+        self.assertEqual(result.final_answer, "supported")
+        self.assertEqual(result.repair_count, 1)
+        self.assertEqual(len(result.committed_states), 1)
+        self.assertEqual(result.committed_states[0].source_step_start, 2)
+        self.assertEqual(result.committed_states[0].source_step_end, 5)
+        self.assertEqual(
+            [record["status"] for record in harness.trace_buffer.history()],
+            ["rejected", "accepted", "passed", "accepted", "accepted"],
+        )
+        self.assertFalse(result.degraded)
 
     def test_manager_none_is_an_uninterrupted_worker_baseline(self):
         responses = [
@@ -585,22 +1003,20 @@ class HarnessTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             ManagerDecision(
                 action=ManagerAction.REPAIR,
-                note="uncertain",
                 confidence=0.4,
                 evidence=AnalyticalEvidence(0.4, ("maybe",), ("weak",)),
-                error_hint=ErrorHint("Maybe reconsider.", ("x",), "Might be wrong."),
+                error_hint=ErrorHint(ERROR_HINT_PROMPT, ("x",), "Might be wrong."),
             )
 
     def test_longds_reselection_requires_high_confidence_conflict(self):
         with self.assertRaises(ValueError):
             ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                note="The provisional relation appears inconsistent.",
                 confidence=0.7,
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.RESELECT,
                     relations=(StateRelation(StateRelationType.BRANCH, "S2"),),
-                    reason="Select again from current state and the full store.",
+                    reason="Select again from current state and the compact index.",
                     conflict_evidence=(
                         "The current state uses S2 output but the provisional state was S1.",
                     ),
@@ -619,14 +1035,13 @@ class HarnessTest(unittest.TestCase):
         original = checkpoints.capture("original")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            note="The dirty variable is downstream of a violated constraint.",
             confidence=0.99,
             evidence=AnalyticalEvidence(
                 0.99,
                 ("Only validated variables may be reused.",),
                 ("dirty was created on the rejected branch",),
             ),
-            error_hint=ErrorHint("Recompute from clean inputs.", ("dirty",), "dirty came from the rejected branch."),
+            error_hint=ErrorHint(ERROR_HINT_PROMPT, ("dirty",), "dirty came from the rejected branch."),
             cleanup=CleanupPlan(remove_variables=("dirty",)),
         )
         session = RepairSession(clean)
@@ -654,7 +1069,6 @@ class HarnessTest(unittest.TestCase):
         current = checkpoints.capture("current")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            note="The manager found the same evidenced error after retry.",
             confidence=0.99,
             evidence=AnalyticalEvidence(
                 0.99,
@@ -662,7 +1076,7 @@ class HarnessTest(unittest.TestCase):
                 ("The current result has no execution observation.",),
             ),
             error_hint=ErrorHint(
-                "Verify the affected calculation.",
+                ERROR_HINT_PROMPT,
                 ("result",),
                 "The result is unsupported by an execution observation.",
             ),
@@ -686,7 +1100,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(directives, [RepairDirective.RETRY] * 3)
         self.assertEqual([record["mode"] for record in session.records], ["light", "light", "heavy"])
         self.assertNotIn("keep_for_light", workspace.variables)
-        exhausted = controller.rollback_pass(session, checkpoints)
+        exhausted = controller.abandon_state(session, checkpoints)
         self.assertEqual(exhausted, RepairDirective.RESTORED_ORIGINAL)
         self.assertIn("keep_for_light", workspace.variables)
 
@@ -699,7 +1113,6 @@ class HarnessTest(unittest.TestCase):
         current = checkpoints.capture("current")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            note="A concrete state-local error was found.",
             confidence=0.99,
             evidence=AnalyticalEvidence(
                 0.99,
@@ -707,7 +1120,7 @@ class HarnessTest(unittest.TestCase):
                 ("The current state has no execution result.",),
             ),
             error_hint=ErrorHint(
-                "Re-check the current state.",
+                ERROR_HINT_PROMPT,
                 ("result",),
                 "The current state result is unsupported.",
             ),
@@ -735,10 +1148,9 @@ class HarnessTest(unittest.TestCase):
         predecessor = AnalyticalState(
             id="S1",
             issue="Compute the value",
-            confidence=1.0,
             constraints=(Constraint("Compute 6 * 7."),),
-            used_variables=(VariableRef("result", "S1", value=42, value_type="int"),),
-            conclusions=(Conclusion("C1", "The value is 42.", ("result@S1",)),),
+            used_variables=(VariableRef("result", "S1", value=42),),
+            conclusions=(Conclusion("The value is 42."),),
             relations=(StateRelation(StateRelationType.INIT),),
         )
         store = StateStore()
@@ -757,18 +1169,24 @@ class HarnessTest(unittest.TestCase):
             graph=graph,
         ).run(TaskSpec("relation", "Report the previously computed value."))
 
-        self.assertEqual(manager.start_index[0]["id"], "S1")
-        self.assertEqual(manager.start_index[0]["variable_keys"], ["result@S1"])
         self.assertIsNone(manager.observations[0].worker_step)
         self.assertEqual(manager.observations[0].untraced_steps, ())
-        self.assertEqual(
-            manager.observations[0].stored_states[0]["variables"][0]["value"],
-            42,
-        )
-        self.assertEqual(manager.observations[1].relation_states[0]["id"], "S1")
+        self.assertFalse(hasattr(manager.observations[0], "stored_states"))
+        self.assertFalse(hasattr(manager.observations[1], "relation_states"))
+        self.assertEqual(store.load_state_json("S1")["used_variables"][0]["value"], 42)
         first_worker_prompt = "\n".join(message.content for message in model.message_snapshots[0])
         self.assertIn("<analytical_state_hint>", first_worker_prompt)
-        self.assertIn('"relation_state_ids": [\n    "S1"', first_worker_prompt)
+        hint_json = first_worker_prompt.split("<analytical_state_hint>\n", 1)[1].split(
+            "\n</analytical_state_hint>", 1
+        )[0]
+        hint_states = json.loads(hint_json)
+        self.assertEqual(len(hint_states), 1)
+        self.assertEqual(
+            set(hint_states[0]),
+            {"id", "issue", "conclusions", "relations"},
+        )
+        self.assertEqual(hint_states[0]["id"], "S1")
+        self.assertNotIn("used_variables", hint_states[0])
         self.assertEqual(graph.ancestors("S2"), ("S1",))
         self.assertEqual([state.id for state in result.committed_states], ["S1", "S2"])
         self.assertTrue(result.committed_states[-1].metadata["relations_finalized"])
@@ -777,23 +1195,21 @@ class HarnessTest(unittest.TestCase):
             "confirm",
         )
 
-    def test_longds_clear_conflict_reselects_using_current_state_and_full_store(self):
+    def test_longds_clear_conflict_reselects_using_current_state_and_compact_index(self):
         s1 = AnalyticalState(
             id="S1",
             issue="Produce the first result",
-            confidence=1.0,
             constraints=(Constraint("Use source A."),),
-            used_variables=(VariableRef("result_a", "S1", value=10, value_type="int"),),
-            conclusions=(Conclusion("C1", "Source A result is 10."),),
+            used_variables=(VariableRef("result_a", "S1", value=10),),
+            conclusions=(Conclusion("Source A result is 10."),),
             relations=(StateRelation(StateRelationType.INIT),),
         )
         s2 = AnalyticalState(
             id="S2",
             issue="Produce an alternative result",
-            confidence=1.0,
             constraints=(Constraint("Use source B."),),
-            used_variables=(VariableRef("result_b", "S2", value=20, value_type="int"),),
-            conclusions=(Conclusion("C2", "Source B result is 20."),),
+            used_variables=(VariableRef("result_b", "S2", value=20),),
+            conclusions=(Conclusion("Source B result is 20."),),
             relations=(StateRelation(StateRelationType.BRANCH, "S1"),),
         )
         store = StateStore()
@@ -816,14 +1232,15 @@ class HarnessTest(unittest.TestCase):
         state = result.committed_states[-1]
         reselection_view = manager.observations[3]
         self.assertEqual(
-            reselection_view.current_draft["conclusions"][0]["claim"],
+            reselection_view.current_draft["conclusions"][0],
             "The worker actually reused S2.",
         )
+        self.assertFalse(hasattr(reselection_view, "stored_states"))
+        self.assertFalse(hasattr(reselection_view, "relation_states"))
         self.assertEqual(
-            {item["id"] for item in reselection_view.stored_states},
-            {"S1", "S2"},
+            {item["id"] for item in store.load_store_json()},
+            {"S1", "S2", "S3"},
         )
-        self.assertEqual(reselection_view.relation_states[0]["id"], "S1")
         self.assertEqual(state.metadata["provisional_relations"][0]["related_state_id"], "S1")
         self.assertEqual(state.metadata["final_relations"][0]["related_state_id"], "S2")
         self.assertEqual(state.metadata["relation_finalization_mode"], "reselect")
@@ -831,7 +1248,7 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(graph.edges[-1]["source"], "S2")
         self.assertNotEqual(graph.edges[-1]["source"], "S1")
 
-    def test_manager_rechecks_between_two_light_one_heavy_then_rollback_pass(self):
+    def test_manager_rechecks_between_two_light_one_heavy_then_abandon_state(self):
         model = ScriptedModelClient(
             [
                 json.dumps(
@@ -841,11 +1258,12 @@ class HarnessTest(unittest.TestCase):
             ]
         )
         manager = FixedRepairSequenceManager()
-        result = StateGuardHarness(
+        harness = StateGuardHarness(
             worker=WorkerAgent(model),
             manager=manager,
             workspace=InMemoryWorkspace(),
-        ).run(TaskSpec("fixed-repair", "Return a verified answer."))
+        )
+        result = harness.run(TaskSpec("fixed-repair", "Return a verified answer."))
 
         checked_outputs = [
             observation.worker_step.action.answer
@@ -861,7 +1279,11 @@ class HarnessTest(unittest.TestCase):
         )
         self.assertEqual(result.repair_count, 3)
         self.assertEqual(result.abstained_intervals, 1)
+        self.assertEqual(result.committed_states, ())
+        self.assertEqual(harness._next_state_number, 2)
+        self.assertEqual(manager.observations[-1].available_state_id, "S2")
         self.assertEqual(result.final_answer, "unsupported-0")
+        self.assertEqual(harness.checkpoints.retained_count, 0)
 
     def test_fixed_step_adapter_reviews_five_steps_then_manager_forms_state(self):
         responses = [
@@ -905,7 +1327,7 @@ class HarnessTest(unittest.TestCase):
         relation_selection_view = manager.observations[3]
         self.assertEqual(relation_selection_view.current_draft["relations"], [])
         self.assertEqual(
-            relation_selection_view.current_draft["conclusions"][0]["claim"],
+            relation_selection_view.current_draft["conclusions"][0],
             "The five-step segment completed.",
         )
         self.assertEqual(result.committed_states[-1].source_step_end, 5)
@@ -915,6 +1337,59 @@ class HarnessTest(unittest.TestCase):
             "select",
         )
         self.assertEqual(result.committed_states[-1].metadata["provisional_relations"], [])
+
+    def test_fixed_step_manager_selects_arbitrary_prefix_and_keeps_trailing_steps(self):
+        responses = [
+            json.dumps(
+                {
+                    "type": "tool",
+                    "reasoning": "continue the analysis",
+                    "tool": "noop",
+                    "arguments": {"value": index},
+                }
+            )
+            for index in range(1, 6)
+        ]
+        responses.append(
+            json.dumps({"type": "final", "answer": "done", "reasoning": "step six"})
+        )
+        worker = WorkerAgent(
+            ScriptedModelClient(responses),
+            ToolRegistry([FunctionTool("noop", "Record one test step.", lambda value: {"value": value})]),
+        )
+        manager = ArbitraryBoundaryManager()
+
+        result = StateGuardHarness(
+            worker=worker,
+            manager=manager,
+            workspace=InMemoryWorkspace(),
+            flow_adapter=FixedStepFlowAdapter(window_size=5),
+        ).run(TaskSpec("arbitrary-window", "Complete a multi-stage analysis."))
+
+        state = result.committed_states[-1]
+        self.assertEqual((state.source_step_start, state.source_step_end), (1, 3))
+        self.assertEqual(
+            (
+                manager.observations[1].candidate_start_step,
+                manager.observations[1].candidate_end_step,
+            ),
+            (1, 5),
+        )
+        self.assertEqual(
+            (
+                manager.observations[5].candidate_start_step,
+                manager.observations[5].candidate_end_step,
+            ),
+            (4, 5),
+        )
+        self.assertEqual(
+            (
+                manager.observations[-1].candidate_start_step,
+                manager.observations[-1].candidate_end_step,
+            ),
+            (4, 6),
+        )
+        self.assertEqual(result.final_answer, "done")
 
 
 if __name__ == "__main__":

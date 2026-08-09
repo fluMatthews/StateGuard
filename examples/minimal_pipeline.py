@@ -13,6 +13,7 @@ from stateguard.runtime.evidence_tools import build_manager_evidence_tools
 from stateguard.runtime.executors import IsolatedProbeExecutor
 from stateguard.runtime.workspace import InMemoryWorkspace
 from stateguard.state.graph import StateRelationGraph
+from stateguard.validation.models import ERROR_HINT_PROMPT
 from stateguard.state.store import StateStore
 
 
@@ -36,20 +37,18 @@ manager_responses = [
     outer_final(
         {
             "action": "OPEN_STATE",
-            "note": "Initialize the analytical state from the query before tracing worker steps.",
             "state_header": {
                 "id": "S1",
                 "issue": "Compute 6 * 7",
-                "constraints": [{"text": "Return the value of 6 * 7.", "source": "query"}],
+                "constraints": [{"text": "Return the value of 6 * 7."}],
                 "relations": [{"type": "init", "related_state_id": None}]
             }
         }
     ),
-    outer_final({"action": "RESUME_WORKER", "note": "State S1 is initialized; trace the worker."}),
+    outer_final({"action": "RESUME_WORKER"}),
     outer_final(
         {
             "action": "REPAIR",
-            "note": "The unsupported arithmetic violates the explicit calculation.",
             "confidence": 0.99,
             "analytical_evidence": {
                 "confidence": 0.99,
@@ -58,7 +57,7 @@ manager_responses = [
                 "suspected_step_ids": [1]
             },
             "error_hint": {
-                "prompt": "Re-check the multiplication with a tool.",
+                "prompt": ERROR_HINT_PROMPT,
                 "error_variable": ["final_result"],
                 "faulty_reasoning": "The value 41 is unsupported and inconsistent with 6 * 7."
             }
@@ -67,17 +66,11 @@ manager_responses = [
     outer_final(
         {
             "action": "UPDATE_STATE",
-            "note": "Write the checked repaired trace before relation finalization.",
             "state_update": {
-                "confidence": 0.99,
                 "used_variables": [{
-                    "name": "final_result", "version": "S1", "value": 42,
-                    "value_type": "int", "producer_state_id": "S1", "producer_step_id": 2
+                    "name": "final_result", "version": "S1", "value": 42
                 }],
-                "conclusions": [{
-                    "id": "C1", "claim": "The result is 42.",
-                    "variable_keys": ["final_result@S1"], "evidence_refs": ["worker-step-2"]
-                }],
+                "conclusions": ["The result is 42."],
                 "traced_step_ids": [2]
             }
         }
@@ -85,7 +78,6 @@ manager_responses = [
     outer_final(
         {
             "action": "FINALIZE_RELATIONS",
-            "note": "The checked result confirms that this remains the initial state.",
             "relation_finalization": {
                 "mode": "confirm",
                 "relations": [{"type": "init", "related_state_id": None}],
@@ -96,7 +88,6 @@ manager_responses = [
     outer_final(
         {
             "action": "COMMIT_STATE",
-            "note": "The repaired result satisfies the explicit calculation.",
             "confidence": 0.99
         }
     ),

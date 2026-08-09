@@ -32,7 +32,7 @@ class StateGuardRuntime:
     artifacts: RunArtifactWriter
     checkpoints: CheckpointManager
     worker_executor: CodeExecutor | None
-    manager_probe_executor: IsolatedProbeExecutor | None
+    manager_probe_executor: CodeExecutor | None
 
     @classmethod
     def create(
@@ -48,13 +48,15 @@ class StateGuardRuntime:
         artifacts: RunArtifactWriter | None = None,
         checkpoints: CheckpointManager | None = None,
         worker_executor: CodeExecutor | None = None,
-        manager_probe_executor: IsolatedProbeExecutor | None = None,
+        manager_probe_executor: CodeExecutor | None = None,
     ) -> "StateGuardRuntime":
-        store = state_store if state_store is not None else StateStore()
         relation_graph = graph if graph is not None else StateRelationGraph()
         drafts = draft_store if draft_store is not None else DraftStore()
         trace = trace_buffer if trace_buffer is not None else TraceBuffer()
         writer = artifacts if artifacts is not None else RunArtifactWriter()
+        store = state_store if state_store is not None else StateStore(
+            writer.run_dir / "state_store" / "store.json" if writer.run_dir else None
+        )
         components: dict[str, Any] = {
             "worker": worker,
             "workspace": workspace,
@@ -99,6 +101,7 @@ class StateGuardRuntime:
             bound_tools = build_manager_evidence_tools(
                 state_store=store,
                 workspace=workspace,
+                trace_buffer=trace,
                 probe_executor=manager_probe_executor,
             )
             if len(tools) == 0:
@@ -107,7 +110,10 @@ class StateGuardRuntime:
                 tools.bindings.get("state_store") is store
                 and tools.bindings.get("workspace") is workspace
             ):
-                pass
+                for tool in bound_tools.tools():
+                    if tool.name not in tools:
+                        tools.register(tool)
+                tools.bindings.update(bound_tools.bindings)
             else:
                 reserved = tools.names().intersection(bound_tools.names())
                 if reserved:

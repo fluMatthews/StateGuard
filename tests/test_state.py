@@ -1,4 +1,7 @@
+import json
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from stateguard.state.draft import (
     DraftStore,
@@ -19,19 +22,61 @@ from stateguard.state.store import StateStore
 
 
 def make_state(state_id, relation, value):
-    variable = VariableRef("metric", state_id, value=value, value_type="int", producer_state_id=state_id)
+    variable = VariableRef("metric", state_id, value=value)
     return AnalyticalState(
         id=state_id,
         issue=f"Compute metric at {state_id}",
-        confidence=0.95,
         constraints=(Constraint("Use the executed value."),),
         used_variables=(variable,),
-        conclusions=(Conclusion(f"C{state_id[1:]}", f"metric is {value}", (variable.key,), ("step",)),),
+        conclusions=(Conclusion(f"metric is {value}"),),
         relations=(relation,),
     )
 
 
 class StateStoreTest(unittest.TestCase):
+    def test_persistent_store_writes_aggregate_list_and_one_file_per_state(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "state_store"
+            store = StateStore(root / "store.json")
+            s1 = make_state("S1", StateRelation(StateRelationType.INIT), 1)
+            s2 = make_state("S2", StateRelation(StateRelationType.PROGRESS, "S1"), 2)
+            store.commit(s1)
+            store.commit(s2)
+
+            aggregate = json.loads((root / "store.json").read_text(encoding="utf-8"))
+            self.assertIsInstance(aggregate, list)
+            self.assertEqual([state["id"] for state in aggregate], ["S1", "S2"])
+            compact_index = json.loads(
+                (root / "state_index.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                compact_index,
+                [
+                    {"id": "S1", "issue": "Compute metric at S1", "conclusions": ["metric is 1"]},
+                    {"id": "S2", "issue": "Compute metric at S2", "conclusions": ["metric is 2"]},
+                ],
+            )
+            self.assertEqual(store.load_state_index_json(), compact_index)
+
+            self.assertEqual(
+                json.loads((root / "states" / "S1.json").read_text(encoding="utf-8")),
+                aggregate[0],
+            )
+            self.assertEqual(store.load_store_json(), aggregate)
+            self.assertEqual(store.load_state_json("S2"), aggregate[1])
+
+    def test_worker_state_hint_contains_only_allowed_fields(self):
+        state = make_state("S1", StateRelation(StateRelationType.INIT), 1)
+
+        hint = state.as_state_hint()
+
+        self.assertEqual(
+            set(hint),
+            {"id", "issue", "conclusions", "relations"},
+        )
+        self.assertNotIn("used_variables", hint)
+        self.assertNotIn("constraints", hint)
+
     def test_upstream_correction_is_recorded_only_in_current_state(self):
         store = StateStore()
         upstream = make_state("S1", StateRelation(StateRelationType.INIT), 41)
@@ -40,22 +85,14 @@ class StateStoreTest(unittest.TestCase):
             "corrected_metric",
             "S2",
             value=42,
-            value_type="int",
-            producer_state_id="S2",
         )
         current = AnalyticalState(
             id="S2",
             issue="Use independently verified arithmetic",
-            confidence=0.99,
             constraints=(Constraint("Use the independently executed value."),),
             used_variables=(corrected_variable,),
             conclusions=(
-                Conclusion(
-                    "C2",
-                    "The independently verified value is 42.",
-                    (corrected_variable.key,),
-                    ("isolated-probe",),
-                ),
+                Conclusion("The independently verified value is 42."),
             ),
             relations=(StateRelation(StateRelationType.PROGRESS, "S1"),),
         )
@@ -80,7 +117,6 @@ class StateStoreTest(unittest.TestCase):
             AnalyticalState(
                 id="S2",
                 issue="bad version",
-                confidence=1.0,
                 constraints=(Constraint("use current state version"),),
                 used_variables=(VariableRef("metric", "S1", value=2),),
                 conclusions=(),
@@ -133,6 +169,42 @@ class StateStoreTest(unittest.TestCase):
         graph.add_state(s2)
         self.assertEqual(graph.nodes["S1"]["status"], "committed")
         self.assertEqual(graph.edges[-1], {"source": "S1", "target": "S2", "type": "invalidate"})
+
+    def test_combine_requires_two_or_more_upstream_states(self):
+        common = {
+            "id": "S3",
+            "issue": "Combine two upstream results",
+            "constraints": (Constraint("Use both upstream results."),),
+            "used_variables": (VariableRef("metric", "S3", value=3),),
+            "conclusions": (Conclusion("The two upstream results are combined."),),
+        }
+
+        with self.assertRaises(ValueError):
+            AnalyticalState(
+                **common,
+                relations=(StateRelation(StateRelationType.COMBINE, "S1"),),
+            )
+
+        with self.assertRaises(ValueError):
+            AnalyticalState(
+                **common,
+                relations=(
+                    StateRelation(StateRelationType.PROGRESS, "S1"),
+                    StateRelation(StateRelationType.PROGRESS, "S2"),
+                ),
+            )
+
+        state = AnalyticalState(
+            **common,
+            relations=(
+                StateRelation(StateRelationType.COMBINE, "S1"),
+                StateRelation(StateRelationType.COMBINE, "S2"),
+            ),
+        )
+        self.assertEqual(
+            [relation.related_state_id for relation in state.relations],
+            ["S1", "S2"],
+        )
 
 
 if __name__ == "__main__":

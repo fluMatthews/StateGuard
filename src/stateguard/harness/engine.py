@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from stateguard.adapters.flow import FlowAdapter, TurnFlowAdapter
 from stateguard.agents.base import Agent
 from stateguard.core.events import ManagerFailure, ReActStep
 from stateguard.core.models import TaskSpec
 from stateguard.repair.controller import RepairController, RepairDirective, RepairSession
-from stateguard.runtime.checkpoints import CheckpointManager
+from stateguard.runtime.checkpoints import CheckpointManager, CheckpointRef
 from stateguard.runtime.bundle import StateGuardRuntime
 from stateguard.runtime.executors import CodeExecutor
 from stateguard.runtime.workspace import Workspace
@@ -25,7 +26,7 @@ from .blind_view import BlindViewBuilder, ManagerObservation, assert_blind
 
 
 class Manager(Protocol):
-    def start_task(self, task: TaskSpec, state_index: list[dict[str, Any]]) -> None: ...
+    def start_task(self, task: TaskSpec) -> None: ...
 
     def act(self, observation: ManagerObservation) -> ManagerDecision: ...
 
@@ -127,31 +128,24 @@ class StateGuardHarness:
         self.checkpoints = self.runtime.checkpoints
         self.blind_view = BlindViewBuilder()
         self._manager_failures: list[ManagerFailure] = []
-        self._manager_action_checkpoint = None
         self._manager_action_index: int | None = None
+        committed_numbers = [int(state.id[1:]) for state in self.state_store.all()]
+        self._next_state_number = max(committed_numbers, default=0) + 1
 
     def run(self, task: TaskSpec) -> StateGuardResult:
         self._manager_failures = []
         self._manager_action_index = None
         self.trace_buffer.start_unit(task.id)
         self.flow_adapter.start(task)
-        staged_files = (
-            self.workspace.stage_data_files(task.data_files) if task.data_files else {}
-        )
-        worker_prompt = task.initial_prompt()
-        if staged_files:
-            worker_prompt += (
-                "\n\n<workspace_data_files>\n"
-                + json.dumps(staged_files, ensure_ascii=False, indent=2)
-                + "\n</workspace_data_files>\n"
-                "Use the persistent python tool and the data_files mapping to read these files."
-            )
-        self.flow_adapter.prepare_worker(self.worker, worker_prompt)
+        self.flow_adapter.prepare_worker(self.worker, task, self.workspace)
         if self.manager is None:
             return self._run_without_manager(task)
         assert_blind(task.metadata)
         try:
-            self.manager.start_task(task, self.state_store.index())
+            configure_lifecycle = getattr(self.manager, "configure_lifecycle", None)
+            if callable(configure_lifecycle):
+                configure_lifecycle(self.flow_adapter.lifecycle_prompt())
+            self.manager.start_task(task)
         except Exception as exc:
             self._record_manager_failure(
                 phase="start_task", event_type="TASK_START", exc=exc
@@ -159,42 +153,68 @@ class StateGuardHarness:
             return self._run_without_manager(task)
         interval_start = self.checkpoints.capture("run:start")
         repair_session = RepairSession(interval_start)
+        try:
+            return self._run_managed_task(task, repair_session)
+        finally:
+            # A RepairSession never crosses a benchmark task unit/turn.  LongDS
+            # reuses the live Worker/workspace/store, not historical snapshots.
+            self._release_checkpoint_refs(
+                interval_start,
+                repair_session.interval_start,
+                repair_session.original_branch,
+            )
+
+    def _run_managed_task(
+        self,
+        task: TaskSpec,
+        repair_session: RepairSession,
+    ) -> StateGuardResult:
         latest_step: ReActStep | None = None
         event_type = "TASK_START"
         total_worker_steps = 0
         total_manager_actions = 0
         total_repairs = 0
         abstained = 0
+        manager_cycle_due = self.flow_adapter.review_before_worker()
 
         while True:
-            try:
-                outcome, action_count, repair_delta, abstain_delta = self._manager_cycle(
-                    task=task,
-                    event_type=event_type,
-                    latest_step=latest_step,
-                    repair_session=repair_session,
-                )
-            except Exception as exc:
-                if self._manager_action_checkpoint is not None:
-                    self.checkpoints.restore(self._manager_action_checkpoint)
-                self._record_manager_failure(
-                    phase="act_or_execute",
-                    event_type=event_type,
-                    exc=exc,
-                    action_index=self._manager_action_index,
-                )
-                total_manager_actions += 1
-                if self.worker.done:
-                    break
+            if manager_cycle_due:
+                try:
+                    outcome, action_count, repair_delta, abstain_delta = self._manager_cycle(
+                        task=task,
+                        event_type=event_type,
+                        latest_step=latest_step,
+                        repair_session=repair_session,
+                    )
+                except Exception as exc:
+                    self._record_manager_failure(
+                        phase="act_or_execute",
+                        event_type=event_type,
+                        exc=exc,
+                        action_index=self._manager_action_index,
+                    )
+                    total_manager_actions += 1
+                    if self.worker.done:
+                        break
+                    outcome, action_count, repair_delta, abstain_delta = (
+                        "RESUME",
+                        0,
+                        0,
+                        0,
+                    )
+                total_manager_actions += action_count
+                total_repairs += repair_delta
+                abstained += abstain_delta
+            else:
+                # Single-query workflows initialize the Manager prompt now but
+                # request no control action until the first native review pause.
                 outcome, action_count, repair_delta, abstain_delta = (
                     "RESUME",
                     0,
                     0,
                     0,
                 )
-            total_manager_actions += action_count
-            total_repairs += repair_delta
-            abstained += abstain_delta
+                manager_cycle_due = True
 
             if outcome == "FINISH":
                 break
@@ -294,12 +314,10 @@ class StateGuardHarness:
         last_action_result: dict[str, Any] | None = None
         repairs = 0
         abstained = 0
+        preflight_retry_used = False
 
         for action_index in range(1, self.config.max_manager_actions_per_event + 1):
             self._manager_action_index = action_index
-            self._manager_action_checkpoint = self.checkpoints.capture(
-                f"manager:before:{event_type}:{action_index}"
-            )
             observation = self._manager_observation(
                 task, event_type, latest_step, repair_session, last_action_result
             )
@@ -308,22 +326,66 @@ class StateGuardHarness:
                 "manager",
                 {"event_type": event_type, "observation": observation, "command": command},
             )
+            try:
+                self._preflight_action(command, repair_session)
+            except (KeyError, TypeError, ValueError) as exc:
+                if preflight_retry_used:
+                    raise
+                preflight_retry_used = True
+                last_action_result = {
+                    "action": "ACTION_REJECTED",
+                    "requested_action": command.action.value,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "retry_allowed": True,
+                }
+                self.artifacts.record(
+                    "manager",
+                    {
+                        "event_type": event_type,
+                        "event": "action_preflight_rejected",
+                        **last_action_result,
+                    },
+                )
+                event_type = "ACTION_RESULT"
+                continue
+            preflight_retry_used = False
 
             if command.action is ManagerAction.RESUME_WORKER:
-                if self.worker.done:
-                    raise ValueError("RESUME_WORKER is illegal after a final worker answer")
                 return "RESUME", action_index, repairs, abstained
 
             if command.action is ManagerAction.OPEN_STATE:
-                header = self._open_state(command)
+                header = command.state_header
+                assert header is not None
+                previous_interval = repair_session.interval_start
                 provisional_ids = tuple(self._relation_ids(header.relations))
                 hint_ids = self.flow_adapter.hint_state_ids(provisional_ids)
-                hint = self._relation_hint(header.id, hint_ids)
+                hint = self._relation_hint(hint_ids)
                 should_inject = bool(hint)
+                with self._action_transaction(
+                    f"open_state:{header.id}",
+                    components=("worker", "state_draft"),
+                    repair_session=repair_session,
+                ):
+                    self._open_state(command)
+                    if hint:
+                        self.worker.inject_observation(
+                            hint, metadata={"stateguard": "state_hint"}
+                        )
+                    state_start = self.checkpoints.capture(f"draft:{header.id}:start")
+                    repair_session.begin_state(header.id, state_start)
+                self._next_state_number += 1
+                self._release_checkpoint_refs(previous_interval)
                 if hint:
-                    self.worker.inject_observation(hint)
-                state_start = self.checkpoints.capture(f"draft:{header.id}:start")
-                repair_session.begin_state(header.id, state_start)
+                    self.artifacts.record(
+                        "hint",
+                        {
+                            "kind": "state_hint",
+                            "state_id": header.id,
+                            "related_state_ids": list(hint_ids),
+                            "content": hint,
+                        },
+                    )
                 last_action_result = {
                     "action": "OPEN_STATE",
                     "state_id": header.id,
@@ -335,7 +397,14 @@ class StateGuardHarness:
                 continue
 
             if command.action is ManagerAction.UPDATE_STATE:
-                draft = self._update_state(command.state_update)
+                with self._action_transaction(
+                    "update_state",
+                    components=("state_draft", "trace_buffer"),
+                ):
+                    draft = self._update_state(
+                        command.state_update,
+                        allow_sparse_trace=repair_session.attempts > 0,
+                    )
                 last_action_result = {
                     "action": "UPDATE_STATE",
                     "state_id": draft.header.id,
@@ -345,7 +414,11 @@ class StateGuardHarness:
                 continue
 
             if command.action is ManagerAction.FINALIZE_RELATIONS:
-                draft = self._finalize_relations(command)
+                with self._action_transaction(
+                    "finalize_relations",
+                    components=("state_draft",),
+                ):
+                    draft = self._finalize_relations(command)
                 last_action_result = {
                     "action": "FINALIZE_RELATIONS",
                     "state_id": draft.header.id,
@@ -357,40 +430,92 @@ class StateGuardHarness:
                 continue
 
             if command.action is ManagerAction.COMMIT_STATE:
-                if command.state_update is not None:
-                    self._update_state(command.state_update)
-                state = self._commit_draft()
-                checkpoint = self.checkpoints.capture(f"state:{state.id}")
-                repair_session.complete_state(checkpoint)
+                retired_checkpoints = (
+                    repair_session.interval_start,
+                    repair_session.original_branch,
+                )
+                with self._action_transaction(
+                    "commit_state",
+                    components=(
+                        "state_draft",
+                        "state_store",
+                        "state_graph",
+                        "trace_buffer",
+                    ),
+                    repair_session=repair_session,
+                ):
+                    if command.state_update is not None:
+                        self._update_state(
+                            command.state_update,
+                            allow_sparse_trace=repair_session.attempts > 0,
+                        )
+                    state = self._commit_draft()
+                    checkpoint = self.checkpoints.capture(f"state:{state.id}")
+                    repair_session.complete_state(checkpoint)
+                self._release_checkpoint_refs(*retired_checkpoints)
+                self.artifacts.record(
+                    "trace",
+                    {"event": "state_committed", "history": self.trace_buffer.history()},
+                )
                 last_action_result = {"action": "COMMIT_STATE", "state_id": state.id}
-                if self.worker.done:
+                if self.worker.done and not self.trace_buffer.steps:
                     return "FINISH", action_index, repairs, abstained
                 event_type = "ACTION_RESULT"
                 continue
 
             if command.action is ManagerAction.REPAIR:
                 draft = self.draft_store.current
-                if draft is None:
-                    raise ValueError("REPAIR requires an open current state")
-                if repair_session.state_id != draft.header.id:
-                    raise ValueError(
-                        "repair budget is not bound to the current analytical state"
-                    )
-                current_branch = self.checkpoints.capture(
-                    f"repair:original:attempt:{repair_session.attempts}"
+                assert draft is not None
+                state_id = draft.header.id
+                use_heavy = (
+                    repair_session.attempts + 1
+                    > self.repair_controller.light_repair_attempts
                 )
-                rejected_step_ids = self.trace_buffer.reject_attempt(
-                    repair_session.attempts
-                )
-                self.draft_store.reset_content_for_retry()
-                directive = self.repair_controller.apply(
-                    decision=command,
-                    session=repair_session,
-                    current_branch=current_branch,
-                    worker=self.worker,
-                    workspace=self.workspace,
-                )
+                components = ["worker", "state_draft", "trace_buffer"]
+                if use_heavy:
+                    components.append("workspace")
+                created_original = None
+                try:
+                    with self._action_transaction(
+                        f"{'heavy' if use_heavy else 'light'}_repair:{state_id}",
+                        components=tuple(components),
+                        repair_session=repair_session,
+                    ):
+                        current_branch = repair_session.original_branch
+                        if current_branch is None:
+                            created_original = self.checkpoints.capture(
+                                f"repair:original:{state_id}"
+                            )
+                            current_branch = created_original
+                        rejected_step_ids = self.trace_buffer.reject_attempt(
+                            repair_session.attempts
+                        )
+                        self.draft_store.reset_content_for_retry()
+                        directive = self.repair_controller.apply(
+                            decision=command,
+                            session=repair_session,
+                            current_branch=current_branch,
+                            worker=self.worker,
+                            workspace=self.workspace,
+                        )
+                except Exception:
+                    # If the first repair action itself was not applied atomically,
+                    # its newly captured original branch is not owned by the restored
+                    # RepairSession and must not remain retained.
+                    self._release_checkpoint_refs(created_original)
+                    raise
                 self.artifacts.record("repair", repair_session.records[-1])
+                self.artifacts.record(
+                    "hint",
+                    {
+                        "kind": "error_hint",
+                        "state_id": state_id,
+                        "repair_attempt": repair_session.attempts,
+                        "mode": repair_session.records[-1]["mode"],
+                        "error_hint": command.error_hint,
+                        "content": command.error_hint.as_observation(),
+                    },
+                )
                 self.artifacts.record(
                     "trace",
                     {
@@ -404,13 +529,20 @@ class StateGuardHarness:
                 repairs += 1
                 return "RESUME", action_index, repairs, abstained
 
-            if command.action is ManagerAction.ROLLBACK_PASS:
-                if repair_session.attempts < self.repair_controller.max_repairs:
-                    raise ValueError(
-                        "ROLLBACK_PASS is legal only after the heavy retry was checked"
-                    )
-                self.repair_controller.rollback_pass(repair_session, self.checkpoints)
-                self.artifacts.record("repair", repair_session.records[-1])
+            if command.action is ManagerAction.ABANDON_STATE:
+                state_id = repair_session.state_id
+                self.repair_controller.abandon_state(repair_session, self.checkpoints)
+                repair_record = repair_session.records[-1]
+                passed_step_ids = self._settle_abandoned_state(repair_session)
+                self.artifacts.record("repair", repair_record)
+                self.artifacts.record(
+                    "trace",
+                    {
+                        "event": "state_abandoned",
+                        "state_id": state_id,
+                        "step_ids": list(passed_step_ids),
+                    },
+                )
                 abstained += 1
                 if not self.config.fail_open_on_abstain:
                     raise RuntimeError("repair schedule exhausted")
@@ -419,11 +551,29 @@ class StateGuardHarness:
                 return "RESUME", action_index, repairs, abstained
 
             if command.action is ManagerAction.ABSTAIN:
-                current_branch = self.checkpoints.capture("manager:abstain:original")
-                if repair_session.original_branch is None:
-                    repair_session.original_branch = current_branch
-                self.repair_controller.abstain(repair_session, self.checkpoints)
-                self.artifacts.record("repair", repair_session.records[-1])
+                if repair_session.original_branch is not None:
+                    self.repair_controller.abstain(repair_session, self.checkpoints)
+                    self._settle_restored_repair_branch(repair_session)
+                    self.artifacts.record("repair", repair_session.records[-1])
+                else:
+                    previous_interval = repair_session.interval_start
+                    with self._action_transaction(
+                        "abstain_pass",
+                        components=("state_draft", "trace_buffer"),
+                        repair_session=repair_session,
+                    ):
+                        passed_step_ids = self.trace_buffer.pass_uncommitted()
+                        self.draft_store.discard()
+                        clean = self.checkpoints.capture("manager:abstain:pass")
+                        repair_session.complete_state(clean)
+                    self._release_checkpoint_refs(previous_interval)
+                    self.artifacts.record(
+                        "trace",
+                        {
+                            "event": "manager_abstain_pass",
+                            "step_ids": list(passed_step_ids),
+                        },
+                    )
                 abstained += 1
                 if not self.config.fail_open_on_abstain:
                     raise RuntimeError("manager abstained")
@@ -433,7 +583,6 @@ class StateGuardHarness:
 
             raise AssertionError(f"unhandled manager action: {command.action}")
 
-        self._manager_action_checkpoint = self.checkpoints.capture("manager:action_limit")
         raise RuntimeError(
             f"manager exceeded max_manager_actions_per_event={self.config.max_manager_actions_per_event}"
         )
@@ -465,34 +614,207 @@ class StateGuardHarness:
         last_action_result: dict[str, Any] | None,
     ) -> ManagerObservation:
         draft = self.draft_store.current
-        relation_states: list[dict[str, Any]] = []
-        if draft is not None:
-            relation_states = [
-                self.state_store.get(state_id).to_dict()
-                for state_id in self._relation_ids(draft.relations)
-            ]
         return self.blind_view.build(
             task=task,
             event_type=event_type,
             flow_policy=self.flow_adapter.manager_context(),
-            available_state_id=f"S{len(self.state_store) + 1}",
+            available_state_id=f"S{self._next_state_number}",
             worker_step=latest_step,
             untraced_steps=tuple(self.trace_buffer.steps),
-            trace_history=self.trace_buffer.history(),
             current_draft=draft.to_dict() if draft else None,
-            state_index=self.state_store.index(),
-            stored_states=self.state_store.relation_catalog(),
-            relation_states=relation_states,
             workspace_manifest=self.workspace.manifest(),
             repair_attempts=repair_session.attempts,
             last_action_result=last_action_result,
         )
 
+    def _preflight_action(
+        self,
+        command: ManagerDecision,
+        repair_session: RepairSession,
+    ) -> None:
+        """Reject only definite protocol/lifecycle errors before any mutation."""
+        if command.action is ManagerAction.RESUME_WORKER:
+            if self.worker.done:
+                raise ValueError("RESUME_WORKER is illegal after a final worker answer")
+            return
+
+        if command.action is ManagerAction.OPEN_STATE:
+            header = command.state_header
+            if header is None:
+                raise ValueError("OPEN_STATE omitted state_header")
+            available = f"S{self._next_state_number}"
+            if header.id != available:
+                raise ValueError(
+                    f"manager must write available state id {available}, got {header.id}"
+                )
+            if self.draft_store.current is not None:
+                raise ValueError(
+                    f"state {self.draft_store.current.header.id} is still open"
+                )
+            self.flow_adapter.validate_state_open(header, tuple(self.trace_buffer.steps))
+            self._validate_relation_ids(header.relations)
+            return
+
+        if command.action is ManagerAction.UPDATE_STATE:
+            self._preflight_update(
+                command.state_update,
+                allow_sparse_trace=repair_session.attempts > 0,
+            )
+            return
+
+        if command.action is ManagerAction.FINALIZE_RELATIONS:
+            finalization = command.relation_finalization
+            draft = self.draft_store.current
+            if finalization is None:
+                raise ValueError("FINALIZE_RELATIONS omitted relation_finalization")
+            if draft is None:
+                raise ValueError("manager must OPEN_STATE before FINALIZE_RELATIONS")
+            self.flow_adapter.validate_relation_finalization(
+                draft=draft,
+                finalization=finalization,
+                untraced_steps=tuple(self.trace_buffer.steps),
+            )
+            self._validate_relation_ids(finalization.relations)
+            return
+
+        if command.action is ManagerAction.COMMIT_STATE:
+            draft = self.draft_store.current
+            if draft is None:
+                raise ValueError("manager must OPEN_STATE before COMMIT_STATE")
+            if command.state_update is not None:
+                self._preflight_update(
+                    command.state_update,
+                    allow_sparse_trace=repair_session.attempts > 0,
+                )
+            if not draft.relations_finalized:
+                raise ValueError("manager must FINALIZE_RELATIONS before COMMIT_STATE")
+            if any(state.id == draft.header.id for state in self.state_store.all()):
+                raise ValueError(f"state already committed: {draft.header.id}")
+            self._validate_relation_ids(draft.relations)
+            return
+
+        if command.action is ManagerAction.REPAIR:
+            draft = self.draft_store.current
+            if draft is None:
+                raise ValueError("REPAIR requires an open current state")
+            if repair_session.state_id != draft.header.id:
+                raise ValueError(
+                    "repair budget is not bound to the current analytical state"
+                )
+            if repair_session.attempts >= self.repair_controller.max_repairs:
+                raise ValueError("repair schedule exhausted; manager must ABANDON_STATE")
+            return
+
+        if command.action is ManagerAction.ABANDON_STATE:
+            if repair_session.attempts < self.repair_controller.max_repairs:
+                raise ValueError(
+                    "ABANDON_STATE is legal only after the heavy retry was checked"
+                )
+            if repair_session.original_branch is None:
+                raise ValueError("ABANDON_STATE requires an active repair chain")
+            return
+
+        if command.action is ManagerAction.ABSTAIN:
+            return
+
+        raise ValueError(f"unsupported manager action: {command.action}")
+
+    def _preflight_update(
+        self,
+        update: StateUpdate | None,
+        *,
+        allow_sparse_trace: bool,
+    ) -> None:
+        if update is None:
+            raise ValueError("state update is missing")
+        draft = self.draft_store.snapshot()
+        if draft is None:
+            raise ValueError("manager must OPEN_STATE before UPDATE_STATE")
+        if draft.relations_finalized:
+            raise ValueError(
+                "cannot UPDATE_STATE after FINALIZE_RELATIONS; write current state first"
+            )
+        self.trace_buffer.validate_selection(
+            update.traced_step_ids,
+            allow_sparse=allow_sparse_trace,
+        )
+        # Apply to the detached draft to reuse state-local validation without
+        # changing the live draft before the action transaction begins.
+        draft.apply(update)
+
+    def _validate_relation_ids(self, relations: Any) -> None:
+        for state_id in self._relation_ids(relations):
+            self.state_store.get(state_id)
+
+    def _release_checkpoint_refs(
+        self, *references: CheckpointRef | None
+    ) -> None:
+        """Release dead lifecycle checkpoints once no RepairSession can use them."""
+        released: set[str] = set()
+        for reference in references:
+            if reference is None or reference.id in released:
+                continue
+            released.add(reference.id)
+            if self.checkpoints.is_retained(reference):
+                self.checkpoints.release(reference)
+
+    def _settle_restored_repair_branch(self, repair_session: RepairSession) -> None:
+        """Keep only the restored branch and permanently exhaust this state repair."""
+        restored = repair_session.original_branch
+        if restored is None:
+            raise ValueError("restored repair branch is missing")
+        previous_interval = repair_session.interval_start
+        repair_session.interval_start = restored
+        repair_session.original_branch = None
+        repair_session.attempts = self.repair_controller.max_repairs
+        self._release_checkpoint_refs(previous_interval)
+
+
+    def _settle_abandoned_state(
+        self, repair_session: RepairSession
+    ) -> tuple[int, ...]:
+        """Discard the failed draft after restoring the original Worker branch."""
+        restored = repair_session.original_branch
+        if restored is None:
+            raise ValueError("restored repair branch is missing")
+        previous_interval = repair_session.interval_start
+        passed_step_ids = self.trace_buffer.pass_uncommitted()
+        self.draft_store.discard()
+        clean = self.checkpoints.capture("state:abandoned")
+        repair_session.complete_state(clean)
+        self._release_checkpoint_refs(previous_interval, restored)
+        return passed_step_ids
+    @contextmanager
+    def _action_transaction(
+        self,
+        label: str,
+        *,
+        components: tuple[str, ...],
+        repair_session: RepairSession | None = None,
+    ) -> Iterator[None]:
+        """Rollback only components the current Manager action can mutate."""
+        checkpoint = self.checkpoints.capture(
+            f"manager_action:{label}", components=components
+        )
+        repair_snapshot = repair_session.snapshot() if repair_session is not None else None
+        try:
+            yield
+        except Exception:
+            try:
+                self.checkpoints.restore(checkpoint)
+            finally:
+                if repair_session is not None and repair_snapshot is not None:
+                    repair_session.restore(repair_snapshot)
+                self.checkpoints.release(checkpoint)
+            raise
+        else:
+            self.checkpoints.release(checkpoint)
+
     def _open_state(self, command: ManagerDecision) -> StateHeader:
         header = command.state_header
         if header is None:
             raise ValueError("OPEN_STATE omitted state_header")
-        available = f"S{len(self.state_store) + 1}"
+        available = f"S{self._next_state_number}"
         if header.id != available:
             raise ValueError(f"manager must write available state id {available}, got {header.id}")
         self.flow_adapter.validate_state_open(header, tuple(self.trace_buffer.steps))
@@ -501,7 +823,12 @@ class StateGuardHarness:
         self.draft_store.open(header)
         return header
 
-    def _update_state(self, update: StateUpdate | None):
+    def _update_state(
+        self,
+        update: StateUpdate | None,
+        *,
+        allow_sparse_trace: bool,
+    ):
         if update is None:
             raise ValueError("state update is missing")
         draft = self.draft_store.current
@@ -509,7 +836,10 @@ class StateGuardHarness:
             raise ValueError(
                 "cannot UPDATE_STATE after FINALIZE_RELATIONS; write current state first"
             )
-        self.trace_buffer.consume(update.traced_step_ids)
+        self.trace_buffer.consume(
+            update.traced_step_ids,
+            allow_sparse=allow_sparse_trace,
+        )
         return self.draft_store.update(update)
 
     def _finalize_relations(self, command: ManagerDecision):
@@ -529,39 +859,25 @@ class StateGuardHarness:
         return self.draft_store.finalize_relations(finalization)
 
     def _commit_draft(self) -> AnalyticalState:
-        transaction = self.checkpoints.capture("state:precommit")
-        try:
-            draft = self.draft_store.current
-            if draft is None:
-                raise ValueError("manager must OPEN_STATE before COMMIT_STATE")
-            traced_step_ids = tuple(draft.traced_step_ids)
-            state = self.draft_store.close()
-            self.state_store.commit(state)
-            self.graph.add_state(state)
-            self.trace_buffer.accept(traced_step_ids)
-            self.artifacts.record(
-                "trace",
-                {"event": "state_committed", "history": self.trace_buffer.history()},
-            )
-        except Exception:
-            self.checkpoints.restore(transaction)
-            raise
+        draft = self.draft_store.current
+        if draft is None:
+            raise ValueError("manager must OPEN_STATE before COMMIT_STATE")
+        traced_step_ids = tuple(draft.traced_step_ids)
+        state = self.draft_store.close()
+        self.state_store.commit(state)
+        self.graph.add_state(state)
+        self.trace_buffer.accept(traced_step_ids)
         return state
 
-    def _relation_hint(self, state_id: str, hint_state_ids: tuple[str, ...]) -> str:
+    def _relation_hint(self, hint_state_ids: tuple[str, ...]) -> str:
         if not hint_state_ids:
             return ""
         states = [self.state_store.get(item).as_state_hint() for item in hint_state_ids]
-        payload = {
-            "new_state_id": state_id,
-            "relation_state_ids": list(hint_state_ids),
-            "states": states,
-        }
         return (
             "<analytical_state_hint>\n"
-            + json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+            + json.dumps(states, ensure_ascii=False, indent=2, default=str)
             + "\n</analytical_state_hint>\n"
-            "These manager-selected states are observations. Verify them before reuse."
+            "These manager-selected states are observations. For reference only. Verify them before use."
         )
 
     @staticmethod

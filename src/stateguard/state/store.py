@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .models import AnalyticalState
 
@@ -18,10 +18,29 @@ class StateStore:
     Snapshot/restore exists only for harness-owned transactional rollback.
     """
 
-    def __init__(self, artifact_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        artifact_path: Path | None = None,
+        state_dir: Path | None = None,
+        index_path: Path | None = None,
+    ) -> None:
         self._states: dict[str, AnalyticalState] = {}
         self._order: list[str] = []
         self.artifact_path = artifact_path
+        self.state_dir = (
+            state_dir
+            if state_dir is not None
+            else (artifact_path.parent / "states" if artifact_path is not None else None)
+        )
+        self.index_path = (
+            index_path
+            if index_path is not None
+            else (
+                artifact_path.parent / "state_index.json"
+                if artifact_path is not None
+                else None
+            )
+        )
         self._persist()
 
     def commit(self, state: AnalyticalState) -> None:
@@ -45,37 +64,6 @@ class StateStore:
     def all(self) -> tuple[AnalyticalState, ...]:
         return tuple(copy.deepcopy(self._states[state_id]) for state_id in self._order)
 
-    def catalog(self) -> list[dict[str, Any]]:
-        return [state.as_state_hint() for state in self.all()]
-
-    def relation_catalog(self) -> list[dict[str, Any]]:
-        """Manager-visible state contents for evidence-based relation selection."""
-        return [state.as_relation_view() for state in self.all()]
-
-    def index(self) -> list[dict[str, Any]]:
-        """Compact manager-visible index; manager selects related IDs directly."""
-        return [
-            {
-                "id": state.id,
-                "issue": state.issue,
-                "variable_keys": [item.key for item in state.used_variables],
-                "conclusions": [item.claim for item in state.conclusions],
-                "relations": [
-                    {"type": relation.type.value, "related_state_id": relation.related_state_id}
-                    for relation in state.relations
-                ],
-            }
-            for state in self.all()
-        ]
-
-    def variable(self, key: str) -> list[tuple[str, Any]]:
-        matches: list[tuple[str, Any]] = []
-        for state in self.all():
-            for variable in state.used_variables:
-                if variable.key == key or variable.name == key:
-                    matches.append((state.id, variable))
-        return matches
-
     def relation_ids(self, state_id: str) -> tuple[str, ...]:
         """Return only the state's direct, one-hop upstream relation IDs."""
         return tuple(
@@ -83,6 +71,36 @@ class StateStore:
             for relation in self.get(state_id).relations
             if relation.related_state_id is not None
         )
+
+    def load_store_json(self) -> list[dict[str, Any]]:
+        """Load the full aggregate committed-state JSON list for audit."""
+        if self.artifact_path is None:
+            return [state.to_dict() for state in self.all()]
+        payload = json.loads(self.artifact_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("store.json must contain a JSON list of states")
+        return payload
+
+    def load_state_index_json(self) -> list[dict[str, Any]]:
+        """Load the compact relation-selection index exposed to the Manager."""
+        if self.index_path is None:
+            return [_state_index_entry(state) for state in self.all()]
+        payload = json.loads(self.index_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("state_index.json must contain a JSON list")
+        return payload
+
+    def load_state_json(self, state_id: str) -> dict[str, Any]:
+        """Load one committed state's dedicated JSON artifact by exact ID."""
+        # Validate membership before deriving a path and keep reads limited to
+        # committed states owned by this store.
+        self.get(state_id)
+        if self.state_dir is None:
+            return self.get(state_id).to_dict()
+        payload = json.loads((self.state_dir / f"{state_id}.json").read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("id") != state_id:
+            raise ValueError(f"invalid dedicated state artifact for {state_id}")
+        return payload
 
     def snapshot(self) -> tuple[dict[str, AnalyticalState], list[str]]:
         return copy.deepcopy((self._states, self._order))
@@ -97,11 +115,36 @@ class StateStore:
     def _persist(self) -> None:
         if self.artifact_path is None:
             return
-        payload = {
-            "schema_version": "stateguard-state-v2",
-            "states": [state.to_dict() for state in self.all()],
-        }
-        _atomic_json(self.artifact_path, payload)
+        states = [state.to_dict() for state in self.all()]
+        if self.state_dir is None:
+            raise RuntimeError("persistent StateStore requires a dedicated state directory")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        desired_files: set[Path] = set()
+        for state in states:
+            path = self.state_dir / f"{state['id']}.json"
+            desired_files.add(path)
+            _atomic_json(path, state)
+        # Snapshot restore may remove a previously committed state. Keep the
+        # aggregate list and dedicated files transactionally consistent.
+        for path in self.state_dir.glob("S*.json"):
+            if path not in desired_files:
+                path.unlink()
+        _atomic_json(self.artifact_path, states)
+        if self.index_path is None:
+            raise RuntimeError("persistent StateStore requires a state index path")
+        _atomic_json(
+            self.index_path,
+            [_state_index_entry(state) for state in self.all()],
+        )
+
+
+
+def _state_index_entry(state: AnalyticalState) -> dict[str, Any]:
+    return {
+        "id": state.id,
+        "issue": state.issue,
+        "conclusions": [item.claim for item in state.conclusions],
+    }
 
 
 def _atomic_json(path: Path, value: Any) -> None:

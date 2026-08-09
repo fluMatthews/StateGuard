@@ -67,7 +67,6 @@ class AgentAction:
     tool_name: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
     answer: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.kind not in {"tool", "final"}:

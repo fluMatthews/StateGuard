@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any
 
 from stateguard.core.events import ReActStep
 from stateguard.agents.base import Agent
 from stateguard.core.models import TaskSpec
+from stateguard.runtime.workspace import Workspace
 from stateguard.state.draft import (
     RelationFinalization,
     RelationFinalizationMode,
@@ -14,56 +15,60 @@ from stateguard.state.draft import (
     StateHeader,
 )
 
+from .protocol import BenchmarkWorkflow
+
 
 class RelationTiming(str, Enum):
     QUERY_FIRST = "query_first"
     SEGMENT_COMPLETE = "segment_complete"
 
 
-class FlowAdapter(Protocol):
-    """Task-timing semantics consumed by the common StateGuard harness."""
-
-    def start(self, task: TaskSpec) -> None: ...
-
-    def prepare_worker(self, worker: Agent, prompt: str) -> None: ...
-
-    def should_review(self, step: ReActStep, steps_since_review: int) -> bool: ...
-
-    def review_event_type(self, step: ReActStep) -> str: ...
-
-    def manager_context(self) -> dict[str, Any]: ...
-
-    def validate_state_open(
-        self,
-        header: StateHeader,
-        untraced_steps: tuple[ReActStep, ...],
-    ) -> None: ...
-
-    def hint_state_ids(self, provisional_relation_ids: tuple[str, ...]) -> tuple[str, ...]: ...
-
-    def validate_relation_finalization(
-        self,
-        *,
-        draft: StateDraft,
-        finalization: RelationFinalization,
-        untraced_steps: tuple[ReActStep, ...],
-    ) -> None: ...
+# Backward-compatible name. New integrations implement one benchmark-specific
+# BenchmarkWorkflow inside their own adapter package.
+FlowAdapter = BenchmarkWorkflow
 
 
 @dataclass
 class TurnFlowAdapter:
-    """One analytical state per task/turn, initialized from its query."""
+    """Deprecated reference workflow; real benchmarks own a dedicated adapter."""
 
     turn_end_metadata_key: str = "turn_end"
 
     def start(self, task: TaskSpec) -> None:
         del task
 
-    def prepare_worker(self, worker: Agent, prompt: str) -> None:
+    def review_before_worker(self) -> bool:
+        return True
+
+    def prepare_worker(
+        self, worker: Agent, task: TaskSpec, workspace: Workspace
+    ) -> None:
+        staged_files = workspace.stage_data_files(task.data_files) if task.data_files else {}
+        prompt = task.initial_prompt()
+        if staged_files:
+            import json
+
+            prompt += (
+                "\n\n<workspace_data_files>\n"
+                + json.dumps(staged_files, ensure_ascii=False, indent=2)
+                + "\n</workspace_data_files>\n"
+                "Use the persistent python tool and the data_files mapping to read these files."
+            )
         if worker.messages:
             worker.continue_turn(prompt)
         else:
             worker.start(prompt)
+
+    def lifecycle_prompt(self) -> str:
+        return (
+            "One public task unit is one analytical turn. At turn start, open the "
+            "state and provisionally select relations from the query and committed "
+            "store before resuming the worker. Review after the completed turn, write "
+            "and check the state, then confirm relations or reselect only on explicit "
+            "conflict before commit. Before repair trace the contiguous turn; after "
+            "repair the rewritten state may select an execution-ordered subset of its "
+            "retry interval and must close through the accepted terminal step."
+        )
 
     def hint_state_ids(self, provisional_relation_ids: tuple[str, ...]) -> tuple[str, ...]:
         return provisional_relation_ids
@@ -95,7 +100,6 @@ class TurnFlowAdapter:
         return bool(
             step.done
             or step.metadata.get(self.turn_end_metadata_key)
-            or step.action.metadata.get(self.turn_end_metadata_key)
         )
 
     def review_event_type(self, step: ReActStep) -> str:
@@ -108,11 +112,12 @@ class TurnFlowAdapter:
             "state_boundary": "one task/turn",
             "relation_timing": RelationTiming.QUERY_FIRST.value,
             "relation_instruction": (
-                "At turn start, read the current query and the contents of stored_states, then "
-                "write provisional exact related state IDs before tracing. After the current "
-                "state is fully written and checked, validate it against those selected states. "
-                "Confirm by default; only on explicit conflict use the shared current-state plus "
-                "full-store selection procedure to replace them."
+                "At turn start, call load_state_index and compare the current query with its "
+                "compact id/issue/conclusions entries, then write provisional relation IDs before "
+                "tracing. After the current state is fully written and checked, call load_state "
+                "only for the provisionally related IDs needed to verify the relation. Confirm "
+                "by default. Only on explicit conflict call load_state_index again and use the "
+                "shared current-state plus compact-index selection procedure to replace them."
             ),
             "hint_policy": "provisional_relation_states",
             "relation_finalization": "confirm_or_reselect_on_explicit_conflict",
@@ -129,11 +134,13 @@ class TurnFlowAdapter:
             )
         if not header.relations:
             raise ValueError("turn flow requires query-first provisional relations")
+        if not header.issue.strip():
+            raise ValueError("turn flow requires the query-defined issue in the state header")
 
 
 @dataclass
 class FixedStepFlowAdapter:
-    """Review fixed worker-step windows; the manager may or may not form state."""
+    """Deprecated reference workflow; real benchmarks own a dedicated adapter."""
 
     window_size: int = 5
 
@@ -144,8 +151,30 @@ class FixedStepFlowAdapter:
     def start(self, task: TaskSpec) -> None:
         del task
 
-    def prepare_worker(self, worker: Agent, prompt: str) -> None:
+    def review_before_worker(self) -> bool:
+        return True
+
+    def prepare_worker(
+        self, worker: Agent, task: TaskSpec, workspace: Workspace
+    ) -> None:
+        staged_files = workspace.stage_data_files(task.data_files) if task.data_files else {}
+        prompt = task.initial_prompt()
+        if staged_files:
+            import json
+
+            prompt += (
+                "\n\n<workspace_data_files>\n"
+                + json.dumps(staged_files, ensure_ascii=False, indent=2)
+                + "\n</workspace_data_files>"
+            )
         worker.start(prompt)
+
+    def lifecycle_prompt(self) -> str:
+        return (
+            "Pause at the benchmark review cadence. A pause is only an observation "
+            "point: first decide whether pending worker steps form an important state. "
+            "Only then open, write, check, relate, and commit that selected interval."
+        )
 
     def hint_state_ids(self, provisional_relation_ids: tuple[str, ...]) -> tuple[str, ...]:
         del provisional_relation_ids
@@ -158,12 +187,17 @@ class FixedStepFlowAdapter:
         finalization: RelationFinalization,
         untraced_steps: tuple[ReActStep, ...],
     ) -> None:
-        if not draft.traced_step_ids or untraced_steps:
+        if not draft.traced_step_ids:
             raise ValueError(
-                "fixed-step flow must write the complete current state before selecting relations"
+                "fixed-step flow must write the selected current-state interval before "
+                "selecting relations"
             )
         if draft.header.relations:
             raise ValueError("fixed-step state header must not contain provisional relations")
+        if not draft.issue.strip():
+            raise ValueError(
+                "fixed-step flow must write the interval-defined issue in UPDATE_STATE"
+            )
         if finalization.mode is not RelationFinalizationMode.SELECT:
             raise ValueError("fixed-step relation finalization must use select")
 
@@ -181,9 +215,16 @@ class FixedStepFlowAdapter:
             "state_boundary": "manager decides at each review point",
             "relation_timing": RelationTiming.SEGMENT_COMPLETE.value,
             "relation_instruction": (
-                "After a completed segment forms a state, OPEN_STATE with no relations, write the "
-                "complete current state, then use that current state and all stored_states to "
-                "select the final exact five-type relation IDs once."
+                "The review window is only a pause cadence. Pending steps accumulate from the "
+                "candidate_start_step. If they form a state, OPEN_STATE with no relations and "
+                "before repair select any contiguous prefix beginning at that start; its end "
+                "need not align with the review window. After repair, select an execution-ordered "
+                "subset of the rewritten interval; the largest selected step closes that prefix "
+                "and omitted steps inside it are excluded. Leave later pending steps for the "
+                "next state. "
+                "After writing and checking the selected current state, call load_state_index "
+                "and compare its compact id/issue/conclusions entries with the current state to select final "
+                "five-type relation IDs once."
             ),
             "hint_policy": "empty",
             "relation_finalization": "select_once_after_current_state_is_written",
@@ -201,4 +242,9 @@ class FixedStepFlowAdapter:
         if header.relations:
             raise ValueError(
                 "fixed-step flow defers relation selection until current state is written"
+            )
+        if header.issue.strip():
+            raise ValueError(
+                "fixed-step OPEN_STATE may contain only ID and query constraints; "
+                "write the interval-defined issue in UPDATE_STATE"
             )

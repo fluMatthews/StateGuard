@@ -13,11 +13,21 @@ from stateguard.runtime.tools import ToolRegistry
 
 
 DEFAULT_REACT_SYSTEM_PROMPT = """You are a tool-using ReAct agent.
-Return exactly one JSON object per step.
-Tool action: {"type":"tool","reasoning":"...","tool":"name","arguments":{...},"metadata":{}}
-Final action: {"type":"final","reasoning":"...","answer":"...","metadata":{}}
-Use tools for computations and never claim an execution that did not occur.
-When a python tool is available, use it for code execution and inspect its real observation.
+
+Follow the task's explicit requirements and use the available tools whenever
+external data or computation is needed.
+
+Return exactly one JSON action per step.
+
+Tool action:
+{"type":"tool","reasoning":"why this tool call is needed","tool":"tool_name","arguments":{...}}
+
+Final action:
+{"type":"final","reasoning":"why the answer is supported","answer":"final answer"}
+
+Emit only one action at a time. After a tool action, wait for and inspect the
+actual tool result before deciding the next action. Never claim that code ran
+unless a successful tool result was returned. Do not invent tool outputs.
 """
 
 
@@ -57,7 +67,6 @@ def parse_action(text: str) -> AgentAction:
             reasoning=str(value.get("reasoning", "")),
             tool_name=str(value.get("tool", value.get("tool_name", ""))),
             arguments=arguments,
-            metadata=dict(value.get("metadata", {})),
         )
     if kind == "final":
         answer = value.get("answer", "")
@@ -67,7 +76,6 @@ def parse_action(text: str) -> AgentAction:
             kind="final",
             reasoning=str(value.get("reasoning", "")),
             answer=answer,
-            metadata=dict(value.get("metadata", {})),
         )
     raise ActionParseError(f"unsupported action type: {kind!r}")
 
@@ -129,6 +137,10 @@ class ReActAgent:
         self.session.done = False
         self.session.final_answer = None
 
+    def _messages_for_model(self) -> list[Message]:
+        """Return the model payload; subclasses may apply role-specific context policy."""
+        return list(self.session.messages)
+
     def step(self) -> ReActStep:
         if not self.session.messages:
             raise RuntimeError("agent has not been started")
@@ -137,7 +149,7 @@ class ReActAgent:
         if self.session.step_count >= self.max_steps:
             raise RuntimeError(f"agent exceeded max_steps={self.max_steps}")
 
-        response = self.model.complete(list(self.session.messages), self.tools.schemas())
+        response = self.model.complete(self._messages_for_model(), self.tools.schemas())
         action = parse_action(response.content)
         self.session.step_count += 1
         self.session.messages.append(

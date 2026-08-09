@@ -40,14 +40,16 @@ construction, training, and benchmark evaluation are intentionally separate.
 The worker may mutate only its task workspace through worker tools. It runs
 uninterrupted until the adapter boundary (turn end or five steps), then pauses.
 The manager receives the query, the latest step, untraced steps, its current
-draft, the committed-state index, the content of all stored states, exact selected
-relation states, and a workspace manifest. It may inspect provenance and run disposable
-probes, then emits one explicit command:
+draft, a workspace manifest, flow policy, and repair status. Committed states
+are deliberately absent from this automatic observation. The manager loads
+either compact `state_index.json` or one exact `states/S<ID>.json` only when the
+lifecycle requires relation selection or related-state checking. It may inspect
+provenance and run disposable probes, then emits one explicit command:
 
 - `OPEN_STATE`, `UPDATE_STATE`, `FINALIZE_RELATIONS`, or `COMMIT_STATE`;
 - `RESUME_WORKER`;
 - `REPAIR` when a concrete error (or the same error after retry) is established;
-- `ROLLBACK_PASS` after the checked heavy retry still has a clear problem;
+- `ABANDON_STATE` after the checked heavy retry still has a clear problem;
 - `ABSTAIN`.
 
 These decisions belong to the manager. The harness never detects a boundary,
@@ -79,8 +81,8 @@ constraints
 relations: provisional exact IDs selected from the query and stored-state contents
 ```
 
-It then traces worker steps into a mutable draft and writes state-ID-versioned variables,
-conclusions, and confidence. Only after that complete draft is visible does it
+It then traces worker steps into a mutable draft and writes state-ID-versioned variables
+and conclusions. Only after that complete draft is visible does it
 validate the provisional relation against the actual current state and selected
 relation-state contents. It confirms the relation unless concrete evidence shows
 a clear conflict. Only then may it reselect using the current state and all stored
@@ -89,24 +91,30 @@ states. State content cannot change after relation finalization.
 ```text
 id
 issue
-confidence
-constraints
-used_variables: variable_name@state_id (for example, cleaned_df@S4)
-conclusions
+constraints: natural-language text plus optional checking code
+used_variables: name@state_id=value (value may be omitted)
+conclusions: plain natural-language claims
 relations: init | progress | branch | invalidate | combine
 ```
 
-Step span, checkpoint reference, status, and metadata are provenance fields, not
-substitutes for the seven method fields.
+Relation cardinality is semantic: a state with no upstream uses `init`; a state
+with exactly one upstream uses `progress`, `branch`, or `invalidate`; a state
+with two or more upstream states uses one `combine` edge for each distinct
+upstream state. Multiple state IDs are never encoded into one relation field.
 
-Relation search is deliberately absent. The manager sees both a compact index and
-the actual stored-state issues, variable values/versions, conclusions, and relations.
-It reasons over that content and writes exact IDs itself; later loading and
-runtime checking may read only the current state's direct, one-hop upstream
-relation IDs from `StateStore`; it cannot recurse through those parents or traverse
-downstream. The graph is
-only a derived end-of-task visualization/debug artifact. No lexical, BM25, or embedding search
-is part of the core method.
+Step span, checkpoint reference, status, and metadata are provenance fields, not
+substitutes for the six method fields.
+
+Relation search is deliberately absent. `StateStore` persists one aggregate JSON
+list at `state_store/store.json` and one immutable artifact per committed state at
+`state_store/states/S<ID>.json`, plus a compact `state_store/state_index.json`
+containing only id, issue, and conclusions. The manager calls `load_state_index`
+for relation selection and `load_state` when
+checking one exact related ID. It writes exact IDs itself; related-state checking
+is limited to direct, one-hop upstream IDs and cannot recurse through those
+parents or traverse downstream. The graph is only a derived end-of-task
+visualization/debug artifact. No lexical, BM25, or embedding search is part of
+the core method.
 
 `invalidate` is only one of the five relation labels. It represents a new
 counterfactual branch formed by changing a prior state's assumption or condition.
@@ -131,23 +139,35 @@ only three execution semantics:
 
 | Semantic point | `TurnFlowAdapter` | `FixedStepFlowAdapter(5)` |
 |---|---|---|
-| Boundary/state formation | One state per turn; review at turn end | Review every five steps/final; manager decides whether the interval forms state |
+| Boundary/state formation | One state per turn; review at turn end | Review every five steps/final; before repair the manager selects a contiguous prefix from the accumulated candidate interval, independent of review cadence; a post-repair rewrite may select an ordered subset |
 | Relation timing | Query-first provisional IDs; confirm unless explicit conflict requires reselection | No header relation; select once after the complete current state is written |
 | State hint | Inject contents selected by provisional relation IDs | Same hook, with an empty selected-ID set |
 
 In turn flow, an outer benchmark adapter supplies successive turn queries. At
-the start of each turn, the manager reads the current query and full committed
-state contents, then opens the state with provisional relation IDs. After tracing
-and checking the turn it compares the actual state with those selected states. It
-confirms by default; if and only if an explicit conflict exists, it uses the same
-current-state/full-store selection procedure as single-query. Repeating this
-naturally produces the task-level relation graph.
+the start of each turn, the manager calls `load_state_index`, reads the current
+query and compact committed-state index entries, then opens the state with provisional
+relation IDs. After tracing and checking the turn it calls `load_state` only for
+the provisional IDs needed to compare the actual state with those states. It
+confirms by default; if and only if an explicit conflict exists, it calls
+`load_state_index` again and uses the same current-state/compact-index selection
+procedure as single-query. Repeating this naturally produces the task-level
+relation graph.
 
 In fixed-step flow, the worker runs five uninterrupted ReAct steps. At the review
-point the manager may simply resume, or may open a state based on that output,
-attach the selected trace, and check it. The header contains no relation. Once the
-complete current state exists, the manager reads it together with all stored-state
-contents and selects final relation IDs exactly once before commit.
+point the manager may simply resume, leaving the pending interval intact, or may
+open a state based on that output. Its initial header contains only the state ID,
+query constraints, and an empty relation set. The issue, compact variables, plain
+conclusions, and exact trace span are written only after the manager
+selects the actual interval. The candidate interval starts at the first
+untraced step after the previous committed state and may span multiple review
+windows. The manager may select any contiguous prefix from that start, so the
+state end need not be a multiple of five; trailing steps remain pending for a
+later state. After repair, the Manager may instead select only correct supporting
+steps from the rewritten interval in execution order. The largest selected step
+closes that interval prefix, omitted steps inside it are excluded, and steps
+after it remain pending. The header contains no relation. Once the selected current state
+exists, the manager calls `load_state_index`, reads its compact entries together
+with the current state, and selects final relation IDs exactly once before commit.
 
 `TaskAdapter` remains responsible for turning one raw benchmark task into one or
 more `TaskSpec` units, creating one task-level workspace, and submission formatting.
@@ -173,7 +193,7 @@ manager independently chooses:
     ├─ COMMIT_STATE                     (persist state + graph transactionally)
     ├─ inspect/probe, then act again     (manager tool use)
     ├─ REPAIR                            (next fixed light/light/heavy attempt)
-    └─ ROLLBACK_PASS                     (after failed heavy: restore and pass)
+    └─ ABANDON_STATE                     (after failed heavy: restore and pass)
 ```
 
 `ACTION_RESULT` observations let the same long-lived manager continue after a
@@ -185,13 +205,25 @@ attempt steps remain in an append-only trace ledger but never enter committed
 state. Light and heavy both preserve conversation and append the same structured
 error hint. Heavy has exactly one extra operation: deleting only the explicitly
 localized erroneous variables. After every retry, all non-header draft content
-is cleared and the manager must rewrite it from the new worker trace before commit; it
+is cleared and the manager must rewrite it from the new worker trace before
+commit. That post-repair rewrite may select a sparse execution-ordered subset of
+correct supporting steps; excluded steps remain visible in the trace audit but
+do not enter the state. It
 does not rewrite context or delete artifacts. If two light repairs and one heavy
-repair all fail, the manager emits `ROLLBACK_PASS`; the executor restores the
+repair all fail, the manager emits `ABANDON_STATE`; the executor restores the
 first pre-repair worker branch and passes (do-no-harm/fail-open).
 
 The light/light/heavy counter belongs to the current state, not the task, turn,
 or query. Every newly opened state starts a fresh independent three-attempt budget.
+
+The same logical manager session is retained throughout one single-query task or
+one multi-turn task. Its system prompt and controller/task initialization remain
+pinned. Only the model-facing tail is bounded: old complete manager action blocks
+are dropped first, while an observation, its tool calls/results, and terminal
+decision are retained or removed together. The full session remains available in
+run artifacts. Worker steps are persisted once in `worker.jsonl`; the in-memory
+`TraceBuffer` is only the transactional index that marks pending, drafted,
+accepted, rejected, or passed steps and is not a second trace artifact.
 
 `StateGuardRuntime` binds worker, manager, workspace, store, draft, trace ledger,
 graph, artifacts, and composite checkpoints by object identity. A mismatched

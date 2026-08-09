@@ -78,15 +78,16 @@ class TrustedPythonExecutor:
 
 
 class IsolatedProbeExecutor:
-    """Run manager probes against a disposable clone of worker variables."""
+    """Run a focused Manager check in fresh scratch with task-data handles only."""
 
     def __init__(self, worker_workspace: InMemoryWorkspace) -> None:
         self.worker_workspace = worker_workspace
 
     def execute(self, code: str) -> ExecutionResult:
-        clone = InMemoryWorkspace(
-            variables=safe_clone(self.worker_workspace.variables),
-            artifacts=safe_clone(self.worker_workspace.artifacts),
-            data_files=safe_clone(self.worker_workspace.data_files),
+        data_files = safe_clone(self.worker_workspace.data_files)
+        scratch = InMemoryWorkspace(
+            variables={"data_files": data_files},
+            artifacts={},
+            data_files=data_files,
         )
-        return TrustedPythonExecutor(clone).execute(code)
+        return TrustedPythonExecutor(scratch).execute(code)

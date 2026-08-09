@@ -69,19 +69,76 @@ class TraceBuffer:
             raise ValueError(f"duplicate worker step id: {step.step_id}")
         self.records.append(TraceRecord(step, repair_attempt))
 
-    def consume(self, step_ids: tuple[int, ...]) -> None:
-        selected = set(step_ids)
-        pending = {
+    def get(self, step_id: int) -> TraceRecord:
+        """Read one exact worker step without exposing mutable trace state."""
+        for record in self.records:
+            if record.step.step_id == step_id:
+                return copy.deepcopy(record)
+        raise KeyError(f"unknown worker step: {step_id}")
+
+    def validate_selection(
+        self,
+        step_ids: tuple[int, ...],
+        *,
+        allow_sparse: bool = False,
+    ) -> tuple[int, ...]:
+        """Validate a Manager trace selection and return deliberately omitted IDs.
+
+        A normal state closes a contiguous prefix of the pending interval.  Once
+        the current state has entered repair, the Manager may instead select an
+        ordered subset of the rewritten interval: the largest selected step
+        closes that interval prefix and unselected steps inside it are excluded
+        from the state.  Pending steps after that boundary remain available for
+        a later state.
+        """
+        pending_in_order = [
             record.step.step_id
             for record in self.records
             if record.status is TraceStatus.PENDING
-        }
-        unknown = selected.difference(pending)
+        ]
+        selected_list = list(step_ids)
+        selected = set(selected_list)
+        unknown = selected.difference(pending_in_order)
         if unknown:
             raise ValueError(f"manager traced unavailable worker steps: {sorted(unknown)}")
+        if len(selected) != len(selected_list):
+            raise ValueError("manager traced duplicate worker steps")
+
+        if not allow_sparse:
+            expected_prefix = pending_in_order[: len(selected_list)]
+            if selected_list != expected_prefix:
+                raise ValueError(
+                    "a state interval must be a contiguous prefix beginning at the "
+                    f"candidate start; expected {expected_prefix}, got {selected_list}"
+                )
+            return ()
+
+        if not selected_list:
+            return ()
+        positions = {step_id: index for index, step_id in enumerate(pending_in_order)}
+        if selected_list != sorted(selected_list, key=positions.__getitem__):
+            raise ValueError(
+                "a repaired state must trace worker steps in execution order; "
+                f"got {selected_list}"
+            )
+        closed_prefix = pending_in_order[: positions[selected_list[-1]] + 1]
+        return tuple(step_id for step_id in closed_prefix if step_id not in selected)
+
+    def consume(
+        self,
+        step_ids: tuple[int, ...],
+        *,
+        allow_sparse: bool = False,
+    ) -> None:
+        omitted = set(
+            self.validate_selection(step_ids, allow_sparse=allow_sparse)
+        )
+        selected = set(step_ids)
         for record in self.records:
             if record.step.step_id in selected:
                 record.status = TraceStatus.DRAFTED
+            elif record.step.step_id in omitted:
+                record.status = TraceStatus.PASSED
 
     def accept(self, step_ids: tuple[int, ...]) -> None:
         selected = set(step_ids)

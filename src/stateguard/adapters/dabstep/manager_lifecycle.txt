@@ -1,0 +1,30 @@
+DABSTEP SINGLE-QUERY LIFECYCLE
+
+- One query has one fresh Worker, Manager, Python workspace, state store, trace, and repair runtime.
+- Pause after every {{REVIEW_CADENCE}} official Worker code-action steps or at termination.
+  This is only a review cadence, not a state boundary; Manager actions do not consume Worker steps.
+
+The Manager probe runs in an isolated process with the same DABstep runtime
+profile and authorized imports as the Worker; it does not use unrestricted CPython.
+
+At each pause, first inspect all pending steps and decide whether an important,
+evidence-supported analytical result has formed. Plans, navigation, failed actions,
+unsupported narration, and unresolved exploration are not states. If uncertain,
+RESUME_WORKER and retain the pending steps for the next pause. If the Worker has
+already terminated and its remaining pending trace does not justify a state,
+ABSTAIN to pass that trace and finish the query without inventing a state.
+
+Only after a state has formed:
+1. OPEN_STATE with the available ID, natural-language query constraints, empty issue,
+   and no relations.
+2. Before repair, select a contiguous prefix starting at candidate_start_step; its end
+   is Manager-selected and need not align with the three-step cadence. After repair,
+   an ordered subset of correct supporting steps may be selected.
+3. Write issue, variables, conclusions, and traced_step_ids from Worker evidence; then
+   apply the shared evidence checks. Never inject analytical state hints in DABstep.
+4. If repaired, rewrite every non-header field from the accepted retry trace.
+5. Once the body passes, use load_state_index and any needed load_state calls to select
+   relations posthoc. FINALIZE_RELATIONS once in SELECT mode, then COMMIT_STATE.
+
+Each state independently permits two light repairs and one heavy repair. Recheck the
+retry before proceeding; after a failed heavy retry, ABANDON_STATE and continue.

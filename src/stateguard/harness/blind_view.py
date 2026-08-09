@@ -34,6 +34,8 @@ def assert_blind(value: Any, path: str = "$") -> None:
 
 @dataclass(frozen=True)
 class ManagerObservation:
+    """One serialized input snapshot for the manager, not an agent or action."""
+
     event_type: str
     task_id: str
     query: str
@@ -43,11 +45,9 @@ class ManagerObservation:
     available_state_id: str
     worker_step: ReActStep | None
     untraced_steps: tuple[ReActStep, ...]
-    trace_history: tuple[dict[str, Any], ...]
+    candidate_start_step: int | None
+    candidate_end_step: int | None
     current_draft: dict[str, Any] | None
-    state_index: tuple[dict[str, Any], ...]
-    stored_states: tuple[dict[str, Any], ...]
-    relation_states: tuple[dict[str, Any], ...]
     workspace_manifest: dict[str, Any]
     repair_attempts: int
     last_action_result: dict[str, Any] | None = None
@@ -68,11 +68,7 @@ class BlindViewBuilder:
         available_state_id: str,
         worker_step: ReActStep | None,
         untraced_steps: tuple[ReActStep, ...],
-        trace_history: tuple[dict[str, Any], ...] = (),
         current_draft: dict[str, Any] | None,
-        state_index: list[dict[str, Any]],
-        stored_states: list[dict[str, Any]],
-        relation_states: list[dict[str, Any]],
         workspace_manifest: dict[str, Any],
         repair_attempts: int,
         last_action_result: dict[str, Any] | None = None,
@@ -88,11 +84,13 @@ class BlindViewBuilder:
             available_state_id=available_state_id,
             worker_step=worker_step,
             untraced_steps=untraced_steps,
-            trace_history=trace_history,
+            candidate_start_step=(
+                untraced_steps[0].step_id if untraced_steps else None
+            ),
+            candidate_end_step=(
+                untraced_steps[-1].step_id if untraced_steps else None
+            ),
             current_draft=current_draft,
-            state_index=tuple(state_index),
-            stored_states=tuple(stored_states),
-            relation_states=tuple(relation_states),
             workspace_manifest=workspace_manifest,
             repair_attempts=repair_attempts,
             last_action_result=last_action_result,

@@ -9,11 +9,11 @@ The package implements one minimal end-to-end vertical slice:
 1. a role-neutral ReAct core;
 2. an almost-unmodified worker and a long-lived, tool-using manager controller;
 3. manager-owned state boundaries, checking, localization, and repair decisions;
-4. relation selection from the current query/trace and full stored-state contents;
+4. relation selection from the current query/trace and a compact state index;
 5. the full analytical-state schema and five state-relation types from the method;
 6. evidence-grounded validation and structured error hints;
 7. a fixed two-light/one-heavy repair protocol with append-only attempt tracing;
-8. blind manager views and append-only run artifacts.
+8. blind manager views, on-demand exact state loading, and append-only run artifacts.
 
 Benchmark loading, datasets, SFT, RL, and leaderboard evaluators are deliberately
 outside this core package.
@@ -54,6 +54,12 @@ for visualization/debugging. Committed states are verified and immutable to the
 manager. Current-state checking may inspect only direct upstream relation states
 (one hop), which remain read-only.
 
+Committed states are persisted as an aggregate JSON list in
+`state_store/store.json` and as individual immutable files in
+`state_store/states/S<ID>.json`. They are not automatically repeated in every
+manager observation: the manager explicitly loads the complete store for
+relation selection or one exact state for direct related-state checking.
+
 An apparent upstream-value error is corrected only under exceptionally strong,
 independently executed evidence. The replacement is written as a new variable in
 the current state; the verified upstream state and relation are never modified.
@@ -65,11 +71,26 @@ One pipeline supports two execution flows through `FlowAdapter`:
   query before trace, then confirmed after checking the actual state unless clear
   conflict evidence requires reselection; related state hints are injected.
 - `FixedStepFlowAdapter(5)`: review every five worker steps; the manager decides
-  whether the completed segment forms state, writes that state first, and selects
-  relations once from current state plus stored states; no state hint is injected.
+  whether the accumulated pending interval forms state and may select any
+  contiguous prefix beginning after the previous state. Its end need not align
+  with the five-step review cadence. After repair, the rewritten state may use
+  only an execution-ordered subset of its interval; omitted steps inside the
+  selected end boundary are excluded. The manager writes that state first and
+  selects relations once from current state plus stored states; no state hint is
+  injected.
+
+The related-state hint sent to the worker contains only each selected state's
+`id`, `issue`, `confidence`, conclusions, and relations. Full variables,
+constraints, and provenance remain manager-side evidence and are not injected.
 
 The adapters change timing and observation policy only. Worker/manager agents,
 actions, harness execution, state store/graph, validation, and repair are shared.
+
+One logical manager session spans an entire single-query task or multi-turn task.
+Its initial system/controller messages are pinned; later context is truncated
+only in complete observation/action blocks so tool calls never lose their
+results. Worker execution is persisted once in `worker.jsonl`; the in-memory
+trace ledger stores only transactional step status used by the harness.
 
 Passing `manager=None` activates the same worker runtime without any StateGuard
 observation, hint, state write, checkpoint, or repair. This is the decoupled

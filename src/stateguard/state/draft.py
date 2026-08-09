@@ -7,7 +7,14 @@ from typing import Any
 
 from stateguard.core.models import to_jsonable
 
-from .models import AnalyticalState, Conclusion, Constraint, StateRelation, VariableRef
+from .models import (
+    AnalyticalState,
+    Conclusion,
+    Constraint,
+    StateRelation,
+    VariableRef,
+    validate_relation_set,
+)
 
 
 @dataclass(frozen=True)
@@ -15,44 +22,39 @@ class StateHeader:
     """Manager-written state identity and provisional relations."""
 
     id: str
-    issue: str
     constraints: tuple[Constraint, ...]
     relations: tuple[StateRelation, ...]
+    issue: str = ""
 
     def __post_init__(self) -> None:
-        if not self.id.strip() or not self.issue.strip():
-            raise ValueError("state header id and issue must be non-empty")
-        if len(self.relations) != len(set(self.relations)):
-            raise ValueError("state header contains duplicate relations")
+        if not self.id.strip():
+            raise ValueError("state header id must be non-empty")
+        validate_relation_set(self.relations, allow_empty=True)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "StateHeader":
         return cls(
             id=str(value["id"]),
-            issue=str(value["issue"]),
             constraints=tuple(Constraint.from_dict(item) for item in value.get("constraints", [])),
             relations=tuple(StateRelation.from_dict(item) for item in value.get("relations", [])),
+            issue=str(value.get("issue", "")),
         )
 
 
 @dataclass(frozen=True)
 class StateUpdate:
-    confidence: float | None = None
+    issue: str | None = None
     used_variables: tuple[VariableRef, ...] = ()
     conclusions: tuple[Conclusion, ...] = ()
     traced_step_ids: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("draft confidence must be in [0, 1]")
 
     @classmethod
     def from_dict(cls, value: dict[str, Any] | None) -> "StateUpdate":
         value = value or {}
         return cls(
-            confidence=float(value["confidence"]) if value.get("confidence") is not None else None,
+            issue=str(value["issue"]) if value.get("issue") is not None else None,
             used_variables=tuple(VariableRef.from_dict(item) for item in value.get("used_variables", [])),
-            conclusions=tuple(Conclusion.from_dict(item) for item in value.get("conclusions", [])),
+            conclusions=tuple(Conclusion.from_value(item) for item in value.get("conclusions", [])),
             traced_step_ids=tuple(int(item) for item in value.get("traced_step_ids", [])),
         )
 
@@ -75,10 +77,7 @@ class RelationFinalization:
     conflict_evidence: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.relations:
-            raise ValueError("finalized relations must not be empty")
-        if len(self.relations) != len(set(self.relations)):
-            raise ValueError("finalized relations contain duplicates")
+        validate_relation_set(self.relations)
         if not self.reason.strip():
             raise ValueError("relation finalization requires a reason")
         if self.mode is RelationFinalizationMode.RESELECT and not self.conflict_evidence:
@@ -99,7 +98,7 @@ class RelationFinalization:
 @dataclass
 class StateDraft:
     header: StateHeader
-    confidence: float = 0.0
+    issue: str = ""
     used_variables: dict[str, VariableRef] = field(default_factory=dict)
     conclusions: dict[str, Conclusion] = field(default_factory=dict)
     traced_step_ids: list[int] = field(default_factory=list)
@@ -108,9 +107,14 @@ class StateDraft:
     relation_finalization_reason: str = ""
     relation_conflict_evidence: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        self.issue = self.header.issue
+
     def apply(self, update: StateUpdate) -> None:
-        if update.confidence is not None:
-            self.confidence = update.confidence
+        if update.issue is not None:
+            if not update.issue.strip():
+                raise ValueError("state issue must be non-empty when written")
+            self.issue = update.issue
         for variable in update.used_variables:
             if variable.version != self.header.id:
                 raise ValueError(
@@ -119,7 +123,7 @@ class StateDraft:
                 )
             self.used_variables[variable.key] = variable
         for conclusion in update.conclusions:
-            self.conclusions[conclusion.id] = conclusion
+            self.conclusions[conclusion.claim] = conclusion
         for step_id in update.traced_step_ids:
             if step_id not in self.traced_step_ids:
                 self.traced_step_ids.append(step_id)
@@ -140,7 +144,7 @@ class StateDraft:
 
     def reset_content_for_retry(self) -> None:
         """Discard rejected attempt content while preserving query-first header."""
-        self.confidence = 0.0
+        self.issue = self.header.issue
         self.used_variables.clear()
         self.conclusions.clear()
         self.traced_step_ids.clear()
@@ -172,8 +176,7 @@ class StateDraft:
     def to_state(self) -> AnalyticalState:
         return AnalyticalState(
             id=self.header.id,
-            issue=self.header.issue,
-            confidence=self.confidence,
+            issue=self.issue,
             constraints=self.header.constraints,
             used_variables=tuple(self.used_variables.values()),
             conclusions=tuple(self.conclusions.values()),
@@ -187,11 +190,10 @@ class StateDraft:
         metadata = self._relation_metadata()
         return {
             "id": self.header.id,
-            "issue": self.header.issue,
-            "confidence": self.confidence,
-            "constraints": to_jsonable(self.header.constraints),
-            "used_variables": to_jsonable(tuple(self.used_variables.values())),
-            "conclusions": to_jsonable(tuple(self.conclusions.values())),
+            "issue": self.issue,
+            "constraints": [item.to_dict() for item in self.header.constraints],
+            "used_variables": [item.to_dict() for item in self.used_variables.values()],
+            "conclusions": [item.claim for item in self.conclusions.values()],
             "relations": to_jsonable(self.relations),
             "source_step_start": min(self.traced_step_ids) if self.traced_step_ids else None,
             "source_step_end": max(self.traced_step_ids) if self.traced_step_ids else None,

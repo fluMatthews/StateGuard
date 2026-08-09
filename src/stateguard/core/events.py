@@ -21,8 +21,6 @@ class ReActStep:
     def formed_explicit_result(self) -> bool:
         return bool(
             self.done
-            or self.action.metadata.get("important_result")
-            or self.action.metadata.get("state_boundary")
             or (self.observation and self.observation.data.get("important_result"))
         )
 

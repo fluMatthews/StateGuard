@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -38,6 +39,25 @@ class RepairSession:
         self.attempts = 0
         self.records.clear()
 
+    def snapshot(self) -> dict[str, Any]:
+        """Capture the small harness-owned repair ledger for action transactions."""
+        return copy.deepcopy(
+            {
+                "interval_start": self.interval_start,
+                "state_id": self.state_id,
+                "original_branch": self.original_branch,
+                "attempts": self.attempts,
+                "records": self.records,
+            }
+        )
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        self.interval_start = copy.deepcopy(snapshot["interval_start"])
+        self.state_id = copy.deepcopy(snapshot["state_id"])
+        self.original_branch = copy.deepcopy(snapshot["original_branch"])
+        self.attempts = int(snapshot["attempts"])
+        self.records = copy.deepcopy(snapshot["records"])
+
 
 class RepairController:
     """Execute the fixed two-light/one-heavy repair schedule."""
@@ -64,7 +84,7 @@ class RepairController:
         if session.original_branch is None:
             session.original_branch = current_branch
         if session.attempts >= self.max_repairs:
-            raise ValueError("repair schedule exhausted; manager must ROLLBACK_PASS")
+            raise ValueError("repair schedule exhausted; manager must ABANDON_STATE")
 
         session.attempts += 1
         # The manager decides whether the same evidenced error warrants another
@@ -101,15 +121,15 @@ class RepairController:
         return RepairDirective.RETRY
 
     @staticmethod
-    def rollback_pass(
+    def abandon_state(
         session: RepairSession,
         checkpoints: CheckpointManager,
     ) -> RepairDirective:
         """Restore the first erroneous branch after all scheduled retries fail."""
         if session.original_branch is None:
-            raise ValueError("ROLLBACK_PASS requires an active repair chain")
+            raise ValueError("ABANDON_STATE requires an active repair chain")
         checkpoints.restore(session.original_branch)
-        session.records.append({"result": "repair_exhausted_restore_original_and_pass"})
+        session.records.append({"result": "repair_exhausted_restore_original_and_abandon_state"})
         return RepairDirective.RESTORED_ORIGINAL
 
     @staticmethod

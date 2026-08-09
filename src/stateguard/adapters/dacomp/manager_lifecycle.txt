@@ -1,0 +1,37 @@
+DACOMP SINGLE-QUERY LIFECYCLE
+
+- Each instance has one fresh Worker, Manager, workspace, state store, trace, and
+  repair runtime.
+- Pause after every {{REVIEW_CADENCE}} accepted native Worker actions or at termination.
+  A pause is only an observation cadence, not a state boundary, and Manager actions
+  never consume Worker budget.
+
+STATE-FORMATION DECISION
+
+At each pause, first inspect all pending steps from candidate_start_step through
+candidate_end_step and decide whether they contain an important, evidence-supported
+analytical result useful to later work. A plan, navigation step, repeated inspection,
+failed action, unsupported narration, or unresolved exploration is not a state. If uncertain, RESUME_WORKER;
+the pending steps remain available at the next pause.
+
+STATE LIFECYCLE
+
+1. Only after deciding that a state exists, OPEN_STATE with the available ID,
+   natural-language query constraints, an empty issue, and no relations.
+2. Before any repair, select a contiguous prefix beginning at candidate_start_step;
+   its endpoint may be any accepted step and need not align with the pause cadence.
+   After repair, the rewritten state may instead use an execution-ordered subset of
+   correct supporting steps from the attempted interval.
+3. Write issue, variables, conclusions, and traced_step_ids only from the selected
+   Worker evidence, then apply the shared verification rules.
+4. If repaired, rewrite all non-header state content from the new accepted trace.
+   DAComp never injects analytical state hints; only an evidenced REPAIR appends an
+   error hint.
+5. After the state body passes verification, use load_state_index for posthoc relation
+   selection and load_state(id) only for needed candidate details. Finalize the five-
+   type relations once with FINALIZE_RELATIONS mode SELECT, then commit.
+
+REPAIR
+
+Each open state has its own shared schedule: recheck after every retry, allow at most
+two light repairs and one heavy repair, and ABANDON_STATE after a failed heavy retry.

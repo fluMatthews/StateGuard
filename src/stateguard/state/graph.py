@@ -19,7 +19,6 @@ class StateRelationGraph:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: list[dict[str, Any]] = []
         self.variable_producers: dict[str, set[str]] = {}
-        self.conclusion_variables: dict[str, set[str]] = {}
 
     def add_state(self, state: AnalyticalState) -> None:
         if state.id in self.nodes:
@@ -40,10 +39,7 @@ class StateRelationGraph:
                     }
                 )
         for variable in state.used_variables:
-            producer = variable.producer_state_id or state.id
-            self.variable_producers.setdefault(variable.key, set()).add(producer)
-        for conclusion in state.conclusions:
-            self.conclusion_variables[conclusion.id] = set(conclusion.variable_keys)
+            self.variable_producers.setdefault(variable.key, set()).add(state.id)
 
     def ancestors(self, state_id: str) -> tuple[str, ...]:
         reverse: dict[str, list[str]] = {}
@@ -63,7 +59,6 @@ class StateRelationGraph:
                 "nodes": self.nodes,
                 "edges": self.edges,
                 "variable_producers": self.variable_producers,
-                "conclusion_variables": self.conclusion_variables,
             }
         )
 
@@ -71,7 +66,6 @@ class StateRelationGraph:
         self.nodes = copy.deepcopy(snapshot["nodes"])
         self.edges = copy.deepcopy(snapshot["edges"])
         self.variable_producers = copy.deepcopy(snapshot["variable_producers"])
-        self.conclusion_variables = copy.deepcopy(snapshot["conclusion_variables"])
 
     @staticmethod
     def _walk(start: str, adjacency: dict[str, list[str]]) -> tuple[str, ...]:

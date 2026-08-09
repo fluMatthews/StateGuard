@@ -19,8 +19,14 @@ class ManagerAction(str, Enum):
     FINALIZE_RELATIONS = "FINALIZE_RELATIONS"
     COMMIT_STATE = "COMMIT_STATE"
     REPAIR = "REPAIR"
-    ROLLBACK_PASS = "ROLLBACK_PASS"
+    ABANDON_STATE = "ABANDON_STATE"
     ABSTAIN = "ABSTAIN"
+
+
+ERROR_HINT_PROMPT = (
+    "The Manager identified a suspected error in the listed variables or conclusions. "
+    "Review the reason below and re-check the affected analysis; this hint is only for reference."
+)
 
 
 @dataclass(frozen=True)
@@ -34,10 +40,14 @@ class ErrorHint:
             raise ValueError("error hint prompt and faulty_reasoning must be non-empty")
         if not self.error_variable:
             raise ValueError("error hint must identify at least one variable or conclusion")
-        rendered = self.prompt + self.faulty_reasoning
-        if len(rendered) > 4000:
-            raise ValueError("error hint must be a local repair pointer, not a replacement solution")
-        if any(marker in rendered.lower() for marker in ("```python", "<python>", "<answer>")):
+        if self.prompt.strip() != ERROR_HINT_PROMPT:
+            raise ValueError("error hint prompt must use the fixed reference-only template")
+        if len(self.faulty_reasoning) > 2000:
+            raise ValueError("faulty_reasoning must stay local and evidence-focused")
+        if any(
+            marker in self.faulty_reasoning.lower()
+            for marker in ("```python", "<python>", "<answer>")
+        ):
             raise ValueError("error hint may localize an error but may not provide an executable/full answer")
 
     @classmethod
@@ -58,8 +68,7 @@ class ErrorHint:
             f"prompt: {self.prompt}\n"
             f"error_variable: {variables}\n"
             f"faulty_reasoning: {self.faulty_reasoning}\n"
-            "</error_hint>\n"
-            "Re-check the evidence and redo the affected analysis. Use tools to verify the repair."
+            "</error_hint>"
         )
 
 
@@ -106,7 +115,6 @@ class CleanupPlan:
 @dataclass(frozen=True)
 class ManagerDecision:
     action: ManagerAction
-    note: str
     confidence: float = 0.0
     state_header: StateHeader | None = None
     state_update: StateUpdate | None = None
@@ -116,8 +124,6 @@ class ManagerDecision:
     cleanup: CleanupPlan = field(default_factory=CleanupPlan)
 
     def __post_init__(self) -> None:
-        if not self.note.strip():
-            raise ValueError("manager decision requires a note")
         if not 0.0 <= self.confidence <= 1.0:
             raise ValueError("manager confidence must be in [0, 1]")
         if self.action is ManagerAction.OPEN_STATE and self.state_header is None:
@@ -168,7 +174,6 @@ class ManagerDecision:
             evidence_value = value["evidence"]
         return cls(
             action=action,
-            note=str(value.get("note", "")),
             confidence=float(value.get("confidence", 0.0)),
             state_header=StateHeader.from_dict(header_value) if header_value else None,
             state_update=StateUpdate.from_dict(update_value) if update_value is not None else None,

@@ -1,0 +1,20 @@
+LONGDS TURN LIFECYCLE
+
+- One benchmark task contains sequential turns and uses one persistent Worker,
+  Manager, state store, conversation, and Python workspace.
+- At each turn initialization, read the current public query and use
+  load_state_index's compact id/issue/conclusions entries when needed. OPEN_STATE
+  before Worker execution with the query-defined issue, constraints, and provisional
+  exact related-state IDs.
+- Related-state hints are inserted before the first Worker generation. Resume the
+  Worker and do not inspect or interrupt inside the turn.
+- At TURN_END, inspect the complete pending turn trace. Rewrite current draft content
+  after every repair attempt, perform the shared evidence checks, and repair only on
+  clear supported error. Ambiguity passes. Before repair, trace the complete
+  contiguous turn. After repair, select only correct supporting steps from the
+  rewritten turn in execution order; the selection may be sparse but must close
+  through the accepted terminal step so no turn output remains pending.
+- Before commit, compare the completed current state with provisional related states.
+  Confirm by default; reselect from the compact index only on explicit conflict.
+- The shared repair schedule is independent for every state: two light repairs, then
+  one heavy repair. After each retry, inspect whether the error was repaired.
