@@ -19,7 +19,6 @@ class DeterministicValidator:
                 findings.append(
                     ValidationFinding(
                         category="nl_fake_code",
-                        confidence=1.0,
                         message="The worker claimed a tool action but no execution observation exists.",
                         evidence=(f"step {step.step_id} has no tool result",),
                         step_ids=(step.step_id,),
@@ -29,7 +28,6 @@ class DeterministicValidator:
                 findings.append(
                     ValidationFinding(
                         category="execution_error",
-                        confidence=1.0,
                         message="The executed tool call failed.",
                         evidence=(step.observation.error or "tool returned ok=false",),
                         step_ids=(step.step_id,),
@@ -44,7 +42,6 @@ class DeterministicValidator:
                         findings.append(
                             ValidationFinding(
                                 category="syntax_error",
-                                confidence=1.0,
                                 message="Executed Python is syntactically invalid.",
                                 evidence=(f"{exc.msg} at line {exc.lineno}",),
                                 step_ids=(step.step_id,),
@@ -54,7 +51,6 @@ class DeterministicValidator:
                 findings.append(
                     ValidationFinding(
                         category="final_requirement",
-                        confidence=1.0,
                         message="The worker ended with an empty final answer.",
                         evidence=(f"step {step.step_id} final answer is empty",),
                         step_ids=(step.step_id,),

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .official_prompt import official_format_trajectory
+
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -17,6 +19,7 @@ def write_da_stage1_artifacts(
     *,
     run_dir: Path,
     workspace_root: Path,
+    official_root: Path,
     instance_id: str,
     answer: str,
     trajectory: dict[str, Any],
@@ -31,8 +34,11 @@ def write_da_stage1_artifacts(
     # Keep the three-stage baseline's native Stage-1 output alongside the
     # flattened file consumed by the rubric bridge.
     (run_dir / "stage1.md").write_text(report or "", encoding="utf-8")
+    # The official DA rubric channel scores this trajectory rendering (it falls back
+    # to the report only when the trajectory is empty), so it must be produced by the
+    # official exporter rather than dumped as JSON.
     (run_dir / f"{instance_id}-traj.txt").write_text(
-        json.dumps(trajectory, ensure_ascii=False, indent=2, default=str),
+        official_format_trajectory(trajectory.get("trajectory") or [], official_root),
         encoding="utf-8",
     )
     payload = {

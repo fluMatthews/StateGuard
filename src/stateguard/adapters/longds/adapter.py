@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -54,6 +55,9 @@ class LongDSAdapter:
         api_key: str | None = None,
         base_url: str | None = None,
         max_model_len: int = 32768,
+        worker_max_tokens: int | None = None,
+        worker_timeout: float | None = None,
+        worker_max_retries: int | None = None,
         reset_env_times: int = 0,
         data_root: Path | None = None,
         backend_factory: Callable[[], Any] | None = None,
@@ -71,6 +75,9 @@ class LongDSAdapter:
         self.api_key = api_key
         self.base_url = base_url
         self.max_model_len = max_model_len
+        self.worker_max_tokens = worker_max_tokens
+        self.worker_timeout = worker_timeout
+        self.worker_max_retries = worker_max_retries
         self.reset_env_times = reset_env_times
         self.dataset = LongDSDataset(dataset_root, data_root)
 
@@ -85,6 +92,7 @@ class LongDSAdapter:
         self.backend_factory = backend_factory
         self.environment_factory = environment_factory
         self.clean_output = clean_output
+        self._runtime_components_lock = threading.Lock()
 
     def load_tasks(
         self,
@@ -336,7 +344,30 @@ class LongDSAdapter:
                 kwargs["api_key"] = self.api_key
             if self.base_url:
                 kwargs["base_url"] = self.base_url
-            return backends.get_backend(self.backend_type, self.model, **kwargs)
+            if self.worker_timeout is not None:
+                kwargs["timeout"] = self.worker_timeout
+            if self.worker_max_retries is not None:
+                kwargs["max_retries"] = self.worker_max_retries
+            backend = backends.get_backend(self.backend_type, self.model, **kwargs)
+            if (
+                self.backend_type == "litellm"
+                and self.worker_max_tokens is not None
+                and hasattr(backend, "generation_params")
+            ):
+                backend.generation_params["max_tokens"] = self.worker_max_tokens
+                backend.generation_params["max_completion_tokens"] = (
+                    self.worker_max_tokens
+                )
+            if (
+                self.backend_type == "litellm"
+                and self.worker_max_retries is not None
+                and hasattr(backend, "generation_params")
+            ):
+                # Avoid nesting LiteLLM retries inside DSGym's backend loop.
+                backend.generation_params["num_retries"] = max(
+                    0, self.worker_max_retries - 1
+                )
+            return backend
 
         def create_environment() -> Any:
             return environment_module.AllocatedCodeEnv(
@@ -348,16 +379,22 @@ class LongDSAdapter:
         return create_backend, create_environment, utils.clean_jupyter_output
 
     def _ensure_runtime_components(self) -> None:
-        if (
+        if self._runtime_components_ready():
+            return
+        with self._runtime_components_lock:
+            if self._runtime_components_ready():
+                return
+            official = self._official_components()
+            self.backend_factory = self.backend_factory or official[0]
+            self.environment_factory = self.environment_factory or official[1]
+            self.clean_output = self.clean_output or official[2]
+
+    def _runtime_components_ready(self) -> bool:
+        return (
             self.backend_factory is not None
             and self.environment_factory is not None
             and self.clean_output is not None
-        ):
-            return
-        official = self._official_components()
-        self.backend_factory = self.backend_factory or official[0]
-        self.environment_factory = self.environment_factory or official[1]
-        self.clean_output = self.clean_output or official[2]
+        )
 
     def _run_dir(self, task: LongDSTask) -> Path:
         timestamp = datetime.now().strftime("%m%d_%H%M%S")

@@ -27,6 +27,14 @@ from .workflow import DACompWorkflow
 from .workspace import DACompWorkspace
 
 
+# Each DE track ships a different specification, so the parts of it a probe can
+# settle differ. A track absent here renders the lifecycle unchanged.
+_CHECK_TARGETS_BY_TRACK = {
+    DACompTrack.DE_IMPL: "check_targets_de_impl.txt",
+    DACompTrack.DE_EVOL: "check_targets_de_evol.txt",
+}
+
+
 @dataclass(frozen=True)
 class DACompRunResult:
     run_dir: Path
@@ -126,7 +134,11 @@ class DACompAdapter:
             )
             harness = StateGuardHarness(
                 runtime=runtime,
-                flow_adapter=DACompWorkflow(self.review_cadence),
+                flow_adapter=DACompWorkflow(
+                    self.review_cadence,
+                    hint_includes_variables=self.track is not DACompTrack.DA_STAGE1,
+                    check_targets_name=_CHECK_TARGETS_BY_TRACK.get(self.track),
+                ),
                 config=StateGuardConfig(max_worker_steps=self.max_worker_steps),
             )
             state_result = harness.run(task_spec)
@@ -142,6 +154,7 @@ class DACompAdapter:
                 benchmark_result = write_da_stage1_artifacts(
                     run_dir=run_dir,
                     workspace_root=workspace.root,
+                    official_root=self.root,
                     instance_id=task.instance_id,
                     answer=(state_result.final_answer if state_result else ""),
                     trajectory=trajectory,

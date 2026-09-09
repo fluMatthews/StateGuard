@@ -65,9 +65,8 @@ class TurnFlowAdapter:
             "state and provisionally select relations from the query and committed "
             "store before resuming the worker. Review after the completed turn, write "
             "and check the state, then confirm relations or reselect only on explicit "
-            "conflict before commit. Before repair trace the contiguous turn; after "
-            "repair the rewritten state may select an execution-ordered subset of its "
-            "retry interval and must close through the accepted terminal step."
+            "conflict before commit. The harness binds the complete turn automatically, "
+            "including repair history; the Manager never enumerates step IDs."
         )
 
     def hint_state_ids(self, provisional_relation_ids: tuple[str, ...]) -> tuple[str, ...]:
@@ -80,7 +79,7 @@ class TurnFlowAdapter:
         finalization: RelationFinalization,
         untraced_steps: tuple[ReActStep, ...],
     ) -> None:
-        if not draft.traced_step_ids or untraced_steps:
+        if draft.source_interval is None or untraced_steps:
             raise ValueError(
                 "turn flow must trace the completed turn into current state before "
                 "FINALIZE_RELATIONS"
@@ -112,12 +111,11 @@ class TurnFlowAdapter:
             "state_boundary": "one task/turn",
             "relation_timing": RelationTiming.QUERY_FIRST.value,
             "relation_instruction": (
-                "At turn start, call load_state_index and compare the current query with its "
-                "compact id/issue/conclusions entries, then write provisional relation IDs before "
-                "tracing. After the current state is fully written and checked, call load_state "
-                "only for the provisionally related IDs needed to verify the relation. Confirm "
-                "by default. Only on explicit conflict call load_state_index again and use the "
-                "shared current-state plus compact-index selection procedure to replace them."
+                "At turn start, use the harness-supplied compact state index with the current "
+                "query, then write provisional relation IDs before tracing. After the current "
+                "state is fully written and checked, use the automatically refreshed compact "
+                "index and call load_state only for exact related states needed to verify or "
+                "reselect a relation on explicit conflict."
             ),
             "hint_policy": "provisional_relation_states",
             "relation_finalization": "confirm_or_reselect_on_explicit_conflict",
@@ -187,7 +185,7 @@ class FixedStepFlowAdapter:
         finalization: RelationFinalization,
         untraced_steps: tuple[ReActStep, ...],
     ) -> None:
-        if not draft.traced_step_ids:
+        if draft.source_interval is None:
             raise ValueError(
                 "fixed-step flow must write the selected current-state interval before "
                 "selecting relations"
@@ -215,16 +213,13 @@ class FixedStepFlowAdapter:
             "state_boundary": "manager decides at each review point",
             "relation_timing": RelationTiming.SEGMENT_COMPLETE.value,
             "relation_instruction": (
-                "The review window is only a pause cadence. Pending steps accumulate from the "
-                "candidate_start_step. If they form a state, OPEN_STATE with no relations and "
-                "before repair select any contiguous prefix beginning at that start; its end "
-                "need not align with the review window. After repair, select an execution-ordered "
-                "subset of the rewritten interval; the largest selected step closes that prefix "
-                "and omitted steps inside it are excluded. Leave later pending steps for the "
-                "next state. "
-                "After writing and checking the selected current state, call load_state_index "
-                "and compare its compact id/issue/conclusions entries with the current state to select final "
-                "five-type relation IDs once."
+                "The review window is only a pause cadence. If pending steps form a state, "
+                "OPEN_STATE with no relations, then UPDATE_STATE with one inclusive "
+                "source_interval. Its start and end may be any observed pending steps and need "
+                "not align with the review window. Later steps remain pending; after repair "
+                "preserve the interval start and extend only its end. "
+                "After writing and checking the selected current state, use the harness-supplied "
+                "compact id/issue/conclusions index to select final five-type relation IDs once."
             ),
             "hint_policy": "empty",
             "relation_finalization": "select_once_after_current_state_is_written",

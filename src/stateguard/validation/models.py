@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import Any
 
 from stateguard.state.draft import (
     RelationFinalization,
-    RelationFinalizationMode,
     StateHeader,
     StateUpdate,
 )
@@ -56,7 +55,7 @@ class ErrorHint:
         if isinstance(variables, str):
             variables = [variables]
         return cls(
-            prompt=str(value["prompt"]),
+            prompt=ERROR_HINT_PROMPT,
             error_variable=tuple(str(x) for x in variables),
             faulty_reasoning=str(value["faulty_reasoning"]),
         )
@@ -74,15 +73,16 @@ class ErrorHint:
 
 @dataclass(frozen=True)
 class AnalyticalEvidence:
-    confidence: float
     violated_constraints: tuple[str, ...]
     evidence: tuple[str, ...]
-    suspected_state_ids: tuple[str, ...] = ()
+    suspected_state_ids: InitVar[tuple[str, ...] | None] = None
     suspected_step_ids: tuple[int, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("evidence confidence must be in [0, 1]")
+    def __post_init__(
+        self,
+        suspected_state_ids: tuple[str, ...] | None,
+    ) -> None:
+        del suspected_state_ids
         if self.violated_constraints and not self.evidence:
             raise ValueError("a violated constraint requires concrete evidence")
 
@@ -92,40 +92,33 @@ class AnalyticalEvidence:
         if isinstance(constraints, str):
             constraints = [constraints]
         return cls(
-            confidence=float(value.get("confidence", 0.0)),
             violated_constraints=tuple(str(x) for x in constraints),
             evidence=tuple(str(x) for x in value.get("evidence", [])),
-            suspected_state_ids=tuple(str(x) for x in value.get("suspected_state_ids", [])),
             suspected_step_ids=tuple(int(x) for x in value.get("suspected_step_ids", [])),
         )
 
 
 @dataclass(frozen=True)
 class CleanupPlan:
-    remove_variables: tuple[str, ...] = ()
+    """Deprecated constructor compatibility; harness derives cleanup from hint."""
 
-    @classmethod
-    def from_dict(cls, value: dict[str, Any] | None) -> "CleanupPlan":
-        value = value or {}
-        return cls(
-            remove_variables=tuple(str(x) for x in value.get("remove_variables", [])),
-        )
+    remove_variables: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ManagerDecision:
     action: ManagerAction
-    confidence: float = 0.0
     state_header: StateHeader | None = None
     state_update: StateUpdate | None = None
     relation_finalization: RelationFinalization | None = None
     evidence: AnalyticalEvidence | None = None
     error_hint: ErrorHint | None = None
-    cleanup: CleanupPlan = field(default_factory=CleanupPlan)
+    cleanup: InitVar[CleanupPlan | None] = None
 
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.confidence <= 1.0:
-            raise ValueError("manager confidence must be in [0, 1]")
+    def __post_init__(
+        self,
+        cleanup: CleanupPlan | None,
+    ) -> None:
         if self.action is ManagerAction.OPEN_STATE and self.state_header is None:
             raise ValueError("OPEN_STATE requires a manager-written state_header")
         if self.action is ManagerAction.UPDATE_STATE and self.state_update is None:
@@ -135,22 +128,11 @@ class ManagerDecision:
             and self.relation_finalization is None
         ):
             raise ValueError("FINALIZE_RELATIONS requires relation_finalization")
-        if (
-            self.action is ManagerAction.FINALIZE_RELATIONS
-            and self.relation_finalization is not None
-            and self.relation_finalization.mode is RelationFinalizationMode.RESELECT
-            and self.confidence < 0.8
-        ):
-            raise ValueError(
-                "changing a provisional relation requires high-confidence explicit conflict"
-            )
         if self.action is ManagerAction.REPAIR:
-            if self.confidence < 0.8:
-                raise ValueError("repair requires high confidence (>= 0.8); ambiguity must not repair")
             if self.evidence is None or not self.evidence.evidence:
                 raise ValueError("repair requires evidence-grounded localization")
-            if self.evidence.confidence < 0.8 or not self.evidence.violated_constraints:
-                raise ValueError("repair evidence requires high confidence and an explicit violated constraint")
+            if not self.evidence.violated_constraints:
+                raise ValueError("repair evidence requires an explicit violated constraint")
             if self.error_hint is None:
                 raise ValueError("repair requires a structured error hint")
             if any(
@@ -174,7 +156,6 @@ class ManagerDecision:
             evidence_value = value["evidence"]
         return cls(
             action=action,
-            confidence=float(value.get("confidence", 0.0)),
             state_header=StateHeader.from_dict(header_value) if header_value else None,
             state_update=StateUpdate.from_dict(update_value) if update_value is not None else None,
             relation_finalization=(
@@ -182,7 +163,6 @@ class ManagerDecision:
             ),
             evidence=AnalyticalEvidence.from_dict(evidence_value) if evidence_value else None,
             error_hint=ErrorHint.from_dict(value["error_hint"]) if value.get("error_hint") else None,
-            cleanup=CleanupPlan.from_dict(value.get("cleanup")),
         )
 
 
@@ -192,7 +172,6 @@ ManagerCommand = ManagerDecision
 @dataclass(frozen=True)
 class ValidationFinding:
     category: str
-    confidence: float
     message: str
     evidence: tuple[str, ...]
     step_ids: tuple[int, ...] = ()

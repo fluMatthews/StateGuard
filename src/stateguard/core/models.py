@@ -69,12 +69,12 @@ class AgentAction:
     answer: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"tool", "final"}:
-            raise ValueError("action kind must be 'tool' or 'final'")
+        if self.kind not in {"tool", "final", "control"}:
+            raise ValueError("action kind must be 'tool', 'final', or 'control'")
         if self.kind == "tool" and not self.tool_name:
             raise ValueError("tool actions require tool_name")
-        if self.kind == "final" and self.answer is None:
-            raise ValueError("final actions require answer")
+        if self.kind in {"final", "control"} and self.answer is None:
+            raise ValueError(f"{self.kind} actions require answer")
 
 
 @dataclass(frozen=True)

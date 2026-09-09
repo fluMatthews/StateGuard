@@ -95,10 +95,7 @@ class RepairController:
         # only by deleting the manager-identified erroneous variables before the
         # same structured hint is appended.
         if use_heavy:
-            remove_variables = (
-                decision.cleanup.remove_variables
-                or decision.error_hint.error_variable
-            )
+            remove_variables = decision.error_hint.error_variable
             workspace.remove_variables(remove_variables)
         else:
             remove_variables = ()

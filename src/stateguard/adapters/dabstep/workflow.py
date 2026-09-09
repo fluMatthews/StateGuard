@@ -21,6 +21,7 @@ class DABstepWorkflow:
     """Single-query lifecycle over official DABstep code-action steps."""
 
     review_cadence: int = 3
+    review_terminal_pending: bool = True
 
     def __post_init__(self) -> None:
         if self.review_cadence < 1:
@@ -64,11 +65,19 @@ class DABstepWorkflow:
             "worker_budget_scope": (
                 "official DABstep code-action steps; Manager actions excluded"
             ),
+            "review_terminal_pending": self.review_terminal_pending,
         }
 
     def hint_state_ids(self, provisional_relation_ids: tuple[str, ...]) -> tuple[str, ...]:
         del provisional_relation_ids
         return ()
+
+    def resumes_with_state_summary(self) -> bool:
+        """This flow opens states on its own schedule, so a Worker can run a
+        long stretch with no state hint at all. The harness sends the newest
+        committed states when it resumes, and only when the store changed.
+        """
+        return True
 
     def validate_state_open(
         self, header: StateHeader, untraced_steps: tuple[ReActStep, ...]
@@ -91,7 +100,7 @@ class DABstepWorkflow:
         untraced_steps: tuple[ReActStep, ...],
     ) -> None:
         del untraced_steps
-        if not draft.traced_step_ids:
+        if draft.source_interval is None:
             raise ValueError("write the selected DABstep interval before relations")
         if draft.header.relations:
             raise ValueError("DABstep OPEN_STATE cannot contain provisional relations")

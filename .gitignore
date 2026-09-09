@@ -8,3 +8,17 @@ outputs/
 .env
 .env.*
 *.pdf
+
+# Run artifacts, task bundles and training corpora: gigabytes of data, not the
+# code a run needs. stateguard.sft.context is imported by agents/manager.py, so
+# the sft *modules* stay tracked -- only the corpus under it is excluded.
+runs/
+service_logs/
+scripts/
+src/stateguard/rl/
+src/stateguard/sft/sft_data/
+.run_*.sh
+
+# Working backups kept while editing; the tracked file is the current one.
+*.bak_*
+*.orig

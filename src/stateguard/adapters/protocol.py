@@ -36,6 +36,12 @@ class BenchmarkWorkflow(Protocol):
 
     def lifecycle_prompt(self) -> str: ...
 
+    # Optional. A single-query flow has no state hint at OPEN_STATE, so the
+    # Worker never learns what the Manager has already confirmed. Returning
+    # True lets the harness hand it the newest committed states on resume.
+    # Turn flows leave this unimplemented and are unaffected.
+    def resumes_with_state_summary(self) -> bool: ...
+
     def validate_state_open(
         self,
         header: StateHeader,

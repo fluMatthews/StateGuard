@@ -14,6 +14,7 @@ from stateguard.runtime.workspace import InMemoryWorkspace
 from stateguard.state.draft import (
     RelationFinalization,
     RelationFinalizationMode,
+    SourceInterval,
     StateHeader,
     StateUpdate,
 )
@@ -91,6 +92,7 @@ class PrefixManager:
         self.calls += 1
         if self.calls == 1:
             self.assert_step_ids(observation, (1, 2, 3, 4, 5))
+            assert observation.committed_state_index is None
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
                 state_header=StateHeader(
@@ -103,10 +105,11 @@ class PrefixManager:
                 state_update=StateUpdate(
                     issue="formed result",
                     conclusions=(Conclusion("steps 1-3 form the result"),),
-                    traced_step_ids=(1, 2, 3),
+                    source_interval=SourceInterval(1, 3),
                 ),
             )
         if self.calls == 3:
+            assert observation.committed_state_index == ()
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
                 relation_finalization=RelationFinalization(
@@ -119,8 +122,39 @@ class PrefixManager:
             return ManagerDecision(action=ManagerAction.COMMIT_STATE)
         if self.calls == 5:
             return ManagerDecision(action=ManagerAction.RESUME_WORKER)
-        self.assert_step_ids(observation, (4, 5, 6))
-        return ManagerDecision(action=ManagerAction.ABSTAIN)
+        if self.calls == 6:
+            self.assert_step_ids(observation, (4, 5, 6))
+            assert observation.committed_state_index is None
+            return ManagerDecision(
+                action=ManagerAction.OPEN_STATE,
+                state_header=StateHeader(
+                    id="S2", constraints=(Constraint("answer the query"),), relations=()
+                ),
+            )
+        if self.calls == 7:
+            return ManagerDecision(
+                action=ManagerAction.UPDATE_STATE,
+                state_update=StateUpdate(
+                    issue="terminal result",
+                    conclusions=(Conclusion("steps 5-6 complete the result"),),
+                    source_interval=SourceInterval(5, 6),
+                ),
+            )
+        if self.calls == 8:
+            assert tuple(
+                item["id"] for item in observation.committed_state_index
+            ) == ("S1",)
+            return ManagerDecision(
+                action=ManagerAction.FINALIZE_RELATIONS,
+                relation_finalization=RelationFinalization(
+                    RelationFinalizationMode.SELECT,
+                    (StateRelation(StateRelationType.PROGRESS, "S1"),),
+                    "terminal result follows the earlier state",
+                ),
+            )
+        if self.calls == 9:
+            return ManagerDecision(action=ManagerAction.COMMIT_STATE)
+        raise AssertionError(f"unexpected Manager call {self.calls}")
 
     @staticmethod
     def assert_step_ids(observation, expected):
@@ -141,10 +175,18 @@ class DACompManagedFlowTests(unittest.TestCase):
         result = harness.run(TaskSpec("dacomp-test", "query"))
         self.assertTrue(result.completed)
         self.assertEqual(result.final_answer, "answer")
-        self.assertEqual(len(result.committed_states), 1)
+        self.assertEqual(len(result.committed_states), 2)
         self.assertEqual(result.committed_states[0].source_step_start, 1)
         self.assertEqual(result.committed_states[0].source_step_end, 3)
-        self.assertEqual(worker.injected, [])
+        self.assertEqual(result.committed_states[1].source_step_start, 5)
+        self.assertEqual(result.committed_states[1].source_step_end, 6)
+        self.assertEqual(harness.trace_buffer.history()[3]["status"], "passed")
+        # A single-query flow injects no relation state_hint: the Manager picks
+        # its own state boundaries, so there is nothing to hint at OPEN_STATE.
+        # It does receive the resume state_summary once the store grows.
+        kinds = [(metadata or {}).get("stateguard") for _, metadata in worker.injected]
+        self.assertEqual([k for k in kinds if k == "state_hint"], [])
+        self.assertEqual(kinds, ["state_summary"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
 import contextlib
+import time
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import tempfile
@@ -196,11 +198,13 @@ class TwoTurnManager:
     def __init__(self):
         self.action_index = 0
         self.tasks = []
+        self.observations = []
 
     def start_task(self, task):
         self.tasks.append(task)
 
     def act(self, observation):
+        self.observations.append(observation)
         self.action_index += 1
         index = self.action_index
         if index == 1:
@@ -214,16 +218,13 @@ class TwoTurnManager:
                 ),
             )
         if index == 2:
-            return ManagerDecision(action=ManagerAction.RESUME_WORKER)
-        if index == 3:
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
                 state_update=StateUpdate(
                     conclusions=(Conclusion("Q1 answer is 41."),),
-                    traced_step_ids=tuple(step.step_id for step in observation.untraced_steps),
                 ),
             )
-        if index == 4:
+        if index == 3:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
                 relation_finalization=RelationFinalization(
@@ -232,9 +233,9 @@ class TwoTurnManager:
                     "First state remains initialization.",
                 ),
             )
-        if index == 5:
+        if index == 4:
             return ManagerDecision(action=ManagerAction.COMMIT_STATE)
-        if index == 6:
+        if index == 5:
             return ManagerDecision(
                 action=ManagerAction.OPEN_STATE,
                 state_header=StateHeader(
@@ -244,23 +245,65 @@ class TwoTurnManager:
                     relations=(StateRelation(StateRelationType.PROGRESS, "S1"),),
                 ),
             )
-        if index == 7:
-            return ManagerDecision(action=ManagerAction.RESUME_WORKER)
-        if index == 8:
+        if index == 6:
             return ManagerDecision(
                 action=ManagerAction.UPDATE_STATE,
                 state_update=StateUpdate(
                     conclusions=(Conclusion("Q2 answer is 42."),),
-                    traced_step_ids=tuple(step.step_id for step in observation.untraced_steps),
                 ),
             )
-        if index == 9:
+        if index == 7:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
                 relation_finalization=RelationFinalization(
                     RelationFinalizationMode.CONFIRM,
                     (StateRelation(StateRelationType.PROGRESS, "S1"),),
                     "The completed turn directly progresses from S1.",
+                ),
+            )
+        return ManagerDecision(action=ManagerAction.COMMIT_STATE)
+
+
+class FailFirstPreopenManager:
+    """Fail the first mandatory OPEN, then manage the second turn normally."""
+
+    def __init__(self):
+        self.current_task_id = ""
+        self.second_turn_actions = 0
+        self.observations = []
+
+    def start_task(self, task):
+        self.current_task_id = task.id
+
+    def act(self, observation):
+        self.observations.append(observation)
+        if self.current_task_id.endswith("turn_1"):
+            return ManagerDecision(action=ManagerAction.RESUME_WORKER)
+        self.second_turn_actions += 1
+        if self.second_turn_actions == 1:
+            return ManagerDecision(
+                action=ManagerAction.OPEN_STATE,
+                state_header=StateHeader(
+                    id="S2",
+                    issue="Q2",
+                    constraints=(Constraint("Answer Q2."),),
+                    relations=(StateRelation(StateRelationType.INIT),),
+                ),
+            )
+        if self.second_turn_actions == 2:
+            return ManagerDecision(
+                action=ManagerAction.UPDATE_STATE,
+                state_update=StateUpdate(
+                    conclusions=(Conclusion("Q2 answer is 42."),),
+                ),
+            )
+        if self.second_turn_actions == 3:
+            return ManagerDecision(
+                action=ManagerAction.FINALIZE_RELATIONS,
+                relation_finalization=RelationFinalization(
+                    RelationFinalizationMode.CONFIRM,
+                    (StateRelation(StateRelationType.INIT),),
+                    "The skipped predecessor left no committed dependency.",
                 ),
             )
         return ManagerDecision(action=ManagerAction.COMMIT_STATE)
@@ -309,8 +352,7 @@ class LongDSAdapterTest(unittest.TestCase):
         workflow = LongDSWorkflow({}, "system")
         lifecycle = workflow.lifecycle_prompt()
         self.assertIn("LONGDS TURN LIFECYCLE", lifecycle)
-        self.assertIn("do not inspect or interrupt inside the turn", lifecycle)
-        self.assertIn("contiguous turn. After repair", lifecycle)
+        self.assertIn("binds the complete turn automatically", lifecycle)
         self.assertNotIn("STATE-FORMATION DECISION", lifecycle)
 
     def test_baseline_preserves_official_messages_workspace_and_per_turn_budget(self):
@@ -419,6 +461,18 @@ class LongDSAdapterTest(unittest.TestCase):
                 [state.id for state in result.stateguard_results[-1].committed_states],
                 ["S1", "S2"],
             )
+            self.assertEqual([item.manager_actions for item in result.stateguard_results], [4, 4])
+            self.assertEqual(manager.observations[0].committed_state_index, ())
+            self.assertIsNone(manager.observations[1].committed_state_index)
+            self.assertEqual(manager.observations[2].committed_state_index, ())
+            self.assertEqual(
+                [item["id"] for item in manager.observations[4].committed_state_index],
+                ["S1"],
+            )
+            self.assertEqual(
+                [item["id"] for item in manager.observations[6].committed_state_index],
+                ["S1"],
+            )
             second_snapshot = backends[0].snapshots[1]
             hint = [
                 message["content"]
@@ -429,6 +483,52 @@ class LongDSAdapterTest(unittest.TestCase):
             self.assertTrue(hint[0].startswith("<information>"))
             self.assertIn('"id": "S1"', hint[0])
             self.assertNotIn("used_variables", hint[0])
+
+    def test_failed_mandatory_open_skips_only_that_turn_and_consumes_state_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task_root = self._write_dataset(root)
+            adapter = LongDSAdapter(
+                dsgym_root=root / "unused",
+                dataset_root=task_root,
+                output_root=root / "results",
+                model="fake/model",
+                max_steps_per_turn=4,
+                backend_factory=lambda: FakeBackend(
+                    ["<answer>41</answer>", "<answer>42</answer>"]
+                ),
+                environment_factory=lambda: FakeEnvironment(max_turns=4),
+                clean_output=clean_output,
+                system_prompt_template="OFFICIAL DATA={PATH}",
+            )
+            manager = FailFirstPreopenManager()
+
+            result = adapter.run_task(adapter.load_tasks()[0], manager=manager)
+
+            first, second = result.stateguard_results
+            self.assertEqual(first.final_answer, "41")
+            self.assertTrue(first.degraded)
+            self.assertEqual(first.manager_actions, 1)
+            self.assertEqual(first.committed_states, ())
+            self.assertEqual(second.final_answer, "42")
+            self.assertFalse(second.degraded)
+            self.assertEqual(second.manager_actions, 4)
+            self.assertEqual([state.id for state in second.committed_states], ["S2"])
+            self.assertEqual(len(manager.observations), 5)
+            self.assertEqual(manager.observations[1].available_state_id, "S2")
+            state_events = [
+                json.loads(line)
+                for line in (result.run_dir / "stateguard" / "state.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    row.get("event") == "mandatory_preopen_failed"
+                    and row.get("state_id") == "S1"
+                    for row in state_events
+                )
+            )
 
     def test_task_exception_saves_completed_turns_as_official_partial_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -521,6 +621,34 @@ class LongDSAdapterTest(unittest.TestCase):
             self.assertEqual(result.trajectory["metadata"]["error_type"], "RuntimeError")
             self.assertIn("was not allocated", result.trajectory["error"])
 
+    def test_runtime_components_initialize_once_under_concurrency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task_root = self._write_dataset(root)
+            adapter = LongDSAdapter(
+                dsgym_root=root / "unused",
+                dataset_root=task_root,
+                output_root=root / "results",
+                model="fake/model",
+                system_prompt_template="OFFICIAL DATA={PATH}",
+            )
+            calls = 0
+
+            def official_components():
+                nonlocal calls
+                calls += 1
+                time.sleep(0.02)
+                return (lambda: object(), lambda: object(), lambda outputs: "")
+
+            with mock.patch.object(
+                adapter, "_official_components", side_effect=official_components
+            ):
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    list(executor.map(lambda _: adapter._ensure_runtime_components(), range(16)))
+
+            self.assertEqual(calls, 1)
+            self.assertTrue(adapter._runtime_components_ready())
+
     def test_runner_continues_after_one_task_raises(self):
         calls = []
 
@@ -556,6 +684,8 @@ class LongDSAdapterTest(unittest.TestCase):
             api_key=None,
             base_url=None,
             max_model_len=1024,
+            worker_timeout=None,
+            worker_max_retries=None,
             reset_env_times=0,
             task_concurrency=2,
             start_index=0,
@@ -718,3 +848,193 @@ class LongDSAdapterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StateGuardV6LoaderTest(unittest.TestCase):
+    """The v6 release is single-query only and carries its output contract."""
+
+    ROOT = Path("/fs/fast/u2024201619/StateGuard-SFT-Corpus-v6-20")
+
+    def setUp(self) -> None:
+        if not self.ROOT.is_dir():
+            self.skipTest("StateGuard SFT corpus v6 is not installed")
+
+    def test_single_query_tasks_expose_question_guidelines_and_staged_files(self):
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_v6", self.ROOT)
+        tasks = loader.load(mode="single_query")
+        self.assertTrue(tasks)
+        for task in tasks:
+            self.assertEqual(task.mode, "single_query")
+            self.assertEqual(len(task.units), 1)
+            spec = task.units[0].public.task_spec()
+            self.assertEqual(spec.id, f"stateguard_v6/{task.raw_task_id}")
+            self.assertTrue(spec.query.strip())
+            self.assertTrue(spec.context.strip())
+            self.assertTrue(spec.data_files)
+            for path in spec.data_files:
+                self.assertTrue(Path(path).is_file())
+            self.assertIsNotNone(task.units[0].private.reference_answer)
+
+    def test_multi_turn_is_rejected_rather_than_silently_empty(self):
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_v6", self.ROOT)
+        with self.assertRaises(ValueError):
+            loader.load(mode="multi_turn")
+
+    def test_other_corpora_stay_free_of_guidelines(self):
+        """Guidelines are additive; the older sources must render as before."""
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        root = Path("/fs/fast/u2024201619/DSBench/DSBench-v1")
+        if not root.is_dir():
+            self.skipTest("DSBench-v1 is not installed")
+        loader = create_corpus_loader("dsbench_v1", root)
+        for task in loader.load(mode="single_query"):
+            self.assertEqual(task.units[0].public.task_spec().guidelines, ())
+
+
+class StateGuardMediumSingleLoaderTest(unittest.TestCase):
+    """The medium single-query release renders its answer contract for the model."""
+
+    ROOT = Path("/fs/fast/u2024201619/StateGuard-SFT-SingleQuery-Medium-v2")
+
+    def setUp(self) -> None:
+        if not self.ROOT.is_dir():
+            self.skipTest("StateGuard medium single-query corpus is not installed")
+
+    def test_tasks_load_with_rendered_contract_and_staged_files(self):
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_medium_single", self.ROOT)
+        tasks = loader.load(mode="single_query")
+        self.assertTrue(tasks)
+        for task in tasks:
+            self.assertEqual(len(task.units), 1)
+            spec = task.units[0].public.task_spec()
+            self.assertEqual(spec.id, f"stateguard_medium_single/{task.raw_task_id}")
+            self.assertTrue(spec.query.strip())
+            self.assertTrue(spec.data_files)
+            for path in spec.data_files:
+                self.assertTrue(Path(path).is_file())
+            # analysis_rules.md carries the metric definitions and must be staged.
+            self.assertTrue(
+                any(p.endswith("analysis_rules.md") for p in spec.data_files)
+            )
+
+    def test_staged_files_are_exactly_the_declared_list(self):
+        """SQLite drops -wal/-shm sidecars beside a database it opens.
+
+        A directory walk would stage those as task inputs and would make the
+        staged set depend on whether anything had recently read the database, so
+        the loader must follow the task's declared file list instead.
+        """
+        import json as _json
+
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_medium_single", self.ROOT)
+        for task in loader.load(mode="single_query"):
+            task_dir = self.ROOT / "tasks" / task.raw_task_id
+            declared = _json.loads(
+                (task_dir / "question.json").read_text(encoding="utf-8")
+            )["files"]
+            expected = sorted(str((task_dir / item).resolve()) for item in declared)
+            staged = sorted(task.units[0].public.task_spec().data_files)
+            self.assertEqual(staged, expected)
+            for path in staged:
+                self.assertFalse(path.endswith(("-wal", "-shm")), path)
+
+    def test_a_file_outside_the_data_root_is_refused(self):
+        from stateguard.adapters.corpus.dataset import _declared_data_files
+
+        task_dir = self.ROOT / "tasks" / "medium_sq_014"
+        with self.assertRaises(ValueError):
+            _declared_data_files(task_dir, task_dir / "files", ["../question.json"])
+        with self.assertRaises(FileNotFoundError):
+            _declared_data_files(task_dir, task_dir / "files", ["files/absent.csv"])
+        with self.assertRaises(ValueError):
+            _declared_data_files(
+                task_dir,
+                task_dir / "files",
+                ["files/analysis_rules.md", "files/analysis_rules.md"],
+            )
+            joined = "\n".join(spec.guidelines)
+            self.assertIn("exactly these keys", joined)
+            self.assertIsInstance(task.units[0].private.reference_answer, dict)
+
+    def test_multi_turn_is_rejected(self):
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_medium_single", self.ROOT)
+        with self.assertRaises(ValueError):
+            loader.load(mode="multi_turn")
+
+    def test_contract_rendering_handles_a_plain_list(self):
+        """A list-shaped guidelines block passes through unchanged."""
+        from stateguard.adapters.corpus.dataset import _render_answer_contract
+
+        self.assertEqual(_render_answer_contract(["a", "b"]), ("a", "b"))
+        self.assertEqual(_render_answer_contract(None), ())
+
+    def test_answer_contract_reaches_the_worker_context(self):
+        """The DSGym turn prompt is context + question, with no guidelines slot.
+
+        This release states its required keys only in `guidelines`, so a
+        contract left there alone would reach the Manager and never the Worker.
+        """
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        loader = create_corpus_loader("stateguard_medium_single", self.ROOT)
+        for task in loader.load(mode="single_query"):
+            spec = task.units[0].public.task_spec()
+            self.assertIn("Answer contract:", spec.context)
+            for line in spec.guidelines:
+                self.assertIn(line, spec.context)
+
+    def test_other_corpora_keep_their_context_untouched(self):
+        from stateguard.adapters.corpus.dataset import create_corpus_loader
+
+        root = Path("/fs/fast/u2024201619/DSBench/DSBench-v1")
+        if not root.is_dir():
+            self.skipTest("DSBench-v1 is not installed")
+        loader = create_corpus_loader("dsbench_v1", root)
+        for task in loader.load(mode="single_query"):
+            self.assertNotIn("Answer contract:", task.units[0].public.task_spec().context)
+
+
+class AssistantActionNormalisationTest(unittest.TestCase):
+    """The exporter must accept what the runtime accepted, in the runtime's shape."""
+
+    def test_a_narrated_action_is_recovered_as_the_serialized_object(self):
+        from stateguard.sft.activation import _normalize_assistant_action
+
+        narrated = (
+            "I've verified the computation. Now I'll form the state.\n\n"
+            '{"type":"control","reasoning":"ok","answer":{"action":"RESUME_WORKER"}}'
+        )
+        recovered = _normalize_assistant_action(narrated)
+        self.assertEqual(
+            json.loads(recovered),
+            {
+                "type": "control",
+                "reasoning": "ok",
+                "answer": {"action": "RESUME_WORKER"},
+            },
+        )
+        self.assertFalse(recovered.lstrip().startswith("I've"))
+
+    def test_a_clean_action_is_returned_untouched(self):
+        from stateguard.sft.activation import _normalize_assistant_action
+
+        clean = '{"type": "control", "reasoning": "ok", "answer": {"action": "RESUME_WORKER"}}'
+        self.assertEqual(_normalize_assistant_action(clean), clean)
+
+    def test_text_without_any_object_still_raises(self):
+        from stateguard.agents.react import ActionParseError
+        from stateguard.sft.activation import _normalize_assistant_action
+
+        with self.assertRaises(ActionParseError):
+            _normalize_assistant_action("no action at all")

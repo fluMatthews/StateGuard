@@ -3,6 +3,7 @@ from .draft import (
     RelationFinalization,
     RelationFinalizationMode,
     StateDraft,
+    SourceInterval,
     StateHeader,
     StateUpdate,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "RelationFinalization",
     "RelationFinalizationMode",
     "StateDraft",
+    "SourceInterval",
     "StateHeader",
     "StateRelationGraph",
     "StateRelationType",

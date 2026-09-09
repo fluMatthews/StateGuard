@@ -11,6 +11,7 @@ from .state.models import AnalyticalState, StateRelationType, VariableRef
 from .state.draft import (
     RelationFinalization,
     RelationFinalizationMode,
+    SourceInterval,
     StateHeader,
     StateUpdate,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "StateGuardHarness",
     "StateGuardResult",
     "StateGuardRuntime",
+    "SourceInterval",
     "StateHeader",
     "StateManagerAgent",
     "StateRelationType",

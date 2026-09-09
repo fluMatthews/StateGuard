@@ -82,7 +82,7 @@ class StateStore:
         return payload
 
     def load_state_index_json(self) -> list[dict[str, Any]]:
-        """Load the compact relation-selection index exposed to the Manager."""
+        """Load the compact relation-selection index supplied by the harness."""
         if self.index_path is None:
             return [_state_index_entry(state) for state in self.all()]
         payload = json.loads(self.index_path.read_text(encoding="utf-8"))

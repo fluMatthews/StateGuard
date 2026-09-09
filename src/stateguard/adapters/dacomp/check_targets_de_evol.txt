@@ -1,0 +1,11 @@
+CHECK TARGETS
+
+The probe workspace holds the pipeline as delivered -- the populated sql/ files,
+the database that pipeline already built, raw_data/, config/layer_dependencies.yaml,
+question.md -- and not the Worker's edited SQL or the database it rebuilds. There
+is no data contract on this track.
+
+The delivered pipeline carries the parts worth checking. For a model question.md
+does not name, the delivered .sql file and that table's row count, columns and
+key uniqueness are what should still hold. For a model it does name, the
+delivered table is the before state rather than the target.

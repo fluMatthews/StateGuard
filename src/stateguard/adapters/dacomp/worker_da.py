@@ -131,6 +131,33 @@ class DACompDAWorkerAgent:
             response, action = self.agent.predict(self._observation)
             if action is not None:
                 break
+            if response.strip() == "context_length_exceeded":
+                # The prompt has outgrown the model's window. History only ever
+                # grows, so every later step would fail identically; the run
+                # stops here and keeps the trajectory it managed to produce
+                # rather than spending forty retries to reach the same end.
+                self._done = True
+                self._final_answer = ""
+                return ReActStep(
+                    step_id=self._accepted_steps + 1,
+                    action=AgentAction(
+                        kind="final",
+                        reasoning="Context window exceeded; no further step is possible.",
+                        answer="",
+                    ),
+                    observation=None,
+                    done=True,
+                    raw_model_output=response,
+                    metadata={
+                        "benchmark": "dacomp",
+                        "track": "da-stage1",
+                        "official_action": "",
+                        "official_observation": self._observation,
+                        "official_stop_reason": "context_length_exceeded",
+                        "worker_budget_used": self._accepted_steps,
+                        "worker_budget_limit": self.max_steps,
+                    },
+                )
             self._parse_retries += 1
             if self._parse_retries > 40:
                 # Official PromptAgent.run returns ``done=False, result=""``

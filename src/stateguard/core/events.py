@@ -42,3 +42,8 @@ class ManagerFailure:
     error_type: str
     message: str
     action_index: int | None = None
+    # "tool", "control" or None. A malformed envelope raises before its type is
+    # read, so counting how often either kind fails needed the kind recovered
+    # from the raw text, where the opening {"type":"..." survives a truncation
+    # that lands inside the reasoning field.
+    action_kind: str | None = None

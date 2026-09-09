@@ -1,37 +1,68 @@
-DACOMP SINGLE-QUERY LIFECYCLE
+SINGLE-QUERY LIFECYCLE
 
-- Each instance has one fresh Worker, Manager, workspace, state store, trace, and
-  repair runtime.
-- Pause after every {{REVIEW_CADENCE}} accepted native Worker actions or at termination.
-  A pause is only an observation cadence, not a state boundary, and Manager actions
-  never consume Worker budget.
+SCOPE
 
-STATE-FORMATION DECISION
+- One query uses one fresh Worker, Manager, workspace, store, trace, and repair runtime.
+- Pause every {{REVIEW_CADENCE}} accepted official Worker action steps or at termination.
+  A pause is not a state boundary; Manager actions do not consume Worker steps.
+- Every state you commit is injected into the Worker when it resumes. Write conclusions as messages 
+  which are intermediate results the Worker will rely on, not as a private ledger.
+  REPAIR additionally injects an error hint.
 
-At each pause, first inspect all pending steps from candidate_start_step through
-candidate_end_step and decide whether they contain an important, evidence-supported
-analytical result useful to later work. A plan, navigation step, repeated inspection,
-failed action, unsupported narration, or unresolved exploration is not a state. If uncertain, RESUME_WORKER;
-the pending steps remain available at the next pause.
+PENDING AND STATE FORMATION
 
-STATE LIFECYCLE
+- Pending trace begins after the last committed or abandoned state.
+- At each nonterminal pause, decide whether the pending trace has formed a state.
+  The state has formed when the trace produced something a later step will highly rely on:
+    * an important quantity determined with evidence — an input parameter
+      set, a loaded and validated dataset, a vital model, a computed figure;
+    * one explicit sub-stage of the query solved;
+    * the Worker turning from one aspect to another. Such as from exploring to computing, 
+      or from one sub-goal to the next.
+  A multi-step long horizon query normally forms several states in sequence;
+  If nothing has formed yet, RESUME_WORKER and retain all pending steps.
+- If a state has formed, OPEN_STATE, write and check its body, select relations posthoc,
+  then COMMIT_STATE.
+- UPDATE_STATE supplies one inclusive source_interval={start,end}. It may begin
+  anywhere in pending trace and end at any observed step. The next state must
+  begin after the previous interval end. Steps outside the chosen interval are
+  not part of that state; do not enumerate individual step IDs.
+- Tool actions belong to the window from UPDATE_STATE until COMMIT_STATE, while
+  checking the written body and deciding between REPAIR and FINALIZE_RELATIONS.
+  Deciding whether the pending trace forms a state needs no Tool action — that
+  judgement uses the pending trace already in the observation.
+- After repair, preserve the current interval start and extend only its end so
+  the rewritten state covers the original analysis and retry outcome.
+- REPAIR only on clear evidence. After UPDATE_STATE, the harness supplies the
+  compact committed-state index. Select relations once; never confirm or reselect.
 
-1. Only after deciding that a state exists, OPEN_STATE with the available ID,
-   natural-language query constraints, an empty issue, and no relations.
-2. Before any repair, select a contiguous prefix beginning at candidate_start_step;
-   its endpoint may be any accepted step and need not align with the pause cadence.
-   After repair, the rewritten state may instead use an execution-ordered subset of
-   correct supporting steps from the attempted interval.
-3. Write issue, variables, conclusions, and traced_step_ids only from the selected
-   Worker evidence, then apply the shared verification rules.
-4. If repaired, rewrite all non-header state content from the new accepted trace.
-   DAComp never injects analytical state hints; only an evidenced REPAIR appends an
-   error hint.
-5. After the state body passes verification, use load_state_index for posthoc relation
-   selection and load_state(id) only for needed candidate details. Finalize the five-
-   type relations once with FINALIZE_RELATIONS mode SELECT, then commit.
+[[TRACK_CHECK_TARGETS]]
 
-REPAIR
+TERMINAL PENDING
 
-Each open state has its own shared schedule: recheck after every retry, allow at most
-two light repairs and one heavy repair, and ABANDON_STATE after a failed heavy retry.
+At termination, apply the same state-formation and source_interval rules. If the
+remainder forms a state, check it with the normal two-light/one-heavy schedule.
+Otherwise ABSTAIN. After commit, abandonment, or abstention, open no new state;
+an active Worker finishes without further Manager intervention.
+
+[[FLOW_STATE_ACTIONS]]
+5.2 OPEN_STATE
+
+Open once the pending trace has formed a state. The harness assigns id. Do not
+write issue or relations in the header.
+
+{"type":"control","reasoning":"Steps 4-8 determined the scenario's fixed inputs and the quarterly timeline, which every later computation depends on.","answer":{"action":"OPEN_STATE","state_header":{"constraints":[{"text":"Follow the query's explicit scope and output requirements."}]}}}
+
+5.3 UPDATE_STATE
+
+Write the interval-defined state body. The harness assigns variable versions.
+Choose only its inclusive start and end; steps inside are observation context,
+not individually certified evidence.
+
+{"type":"control","reasoning":"The selected pending interval provides the state body.","answer":{"action":"UPDATE_STATE","state_update":{"issue":"Compute the requested result.","source_interval":{"start":1,"end":3},"used_variables":[{"name":"result","value":117}],"conclusions":["The interval produced the requested result."]}}}
+
+5.4 FINALIZE_RELATIONS
+
+Select relations once after the state body is written; never confirm or reselect.
+
+{"type":"control","reasoning":"The completed state requires posthoc relation selection.","answer":{"action":"FINALIZE_RELATIONS","relation_finalization":{"mode":"select","relations":[{"type":"init"}]}}}

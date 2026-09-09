@@ -95,7 +95,7 @@ class StateGuardRuntime:
             )
 
         # A StateManagerAgent with no explicitly supplied tools receives the
-        # evidence tools bound to this exact store/workspace runtime.
+        # Tool actions bound to this exact store/workspace runtime.
         tools = getattr(manager, "tools", None)
         if manager is not None and tools is not None:
             bound_tools = build_manager_evidence_tools(
@@ -118,7 +118,7 @@ class StateGuardRuntime:
                 reserved = tools.names().intersection(bound_tools.names())
                 if reserved:
                     raise ValueError(
-                        "manager evidence tools are bound to an unknown/different runtime: "
+                        "manager Tool actions are bound to an unknown/different runtime: "
                         f"{sorted(reserved)}"
                     )
                 for tool in bound_tools.tools():

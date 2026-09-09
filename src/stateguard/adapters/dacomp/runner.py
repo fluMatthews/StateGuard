@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-cadence", type=int, default=5)
     parser.add_argument("--max-worker-steps", type=int, default=None)
     parser.add_argument("--language", choices=["en", "zh"], default="en")
+    # Some endpoints reject any value but their own default (kimi-k2.6:
+    # "only 1 is allowed for this model"), so the DA worker temperature is
+    # exposed rather than fixed at the official 0.0.
+    parser.add_argument("--da-temperature", type=float, default=0.0)
+    parser.add_argument("--da-top-p", type=float, default=1.0)
     parser.add_argument("--manager-model", default=None)
     parser.add_argument("--manager-api-base", default=None)
     parser.add_argument("--manager-api-key", default=None)
@@ -61,6 +66,8 @@ def main() -> int:
         review_cadence=args.review_cadence,
         max_worker_steps=args.max_worker_steps,
         language=args.language,
+        da_temperature=args.da_temperature,
+        da_top_p=args.da_top_p,
     )
     task_ids = (
         [item.strip() for item in args.task_ids.split(",") if item.strip()]

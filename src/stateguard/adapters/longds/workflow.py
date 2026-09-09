@@ -33,6 +33,10 @@ class LongDSWorkflow:
         # LongDS must choose provisional relations before this turn runs.
         return True
 
+    def automate_turn_start(self) -> bool:
+        """Bind OPEN_STATE to the turn gate and resume Worker mechanically."""
+        return True
+
     def prepare_worker(
         self, worker: Agent, task: TaskSpec, workspace: Workspace
     ) -> None:
@@ -97,7 +101,7 @@ class LongDSWorkflow:
         finalization: RelationFinalization,
         untraced_steps: tuple[ReActStep, ...],
     ) -> None:
-        if not draft.traced_step_ids or untraced_steps:
+        if draft.source_interval is None or untraced_steps:
             raise ValueError("write the complete checked turn before finalizing LongDS relations")
         if finalization.mode is RelationFinalizationMode.CONFIRM:
             if set(finalization.relations) != set(draft.header.relations):

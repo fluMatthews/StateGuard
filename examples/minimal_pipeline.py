@@ -49,9 +49,7 @@ manager_responses = [
     outer_final(
         {
             "action": "REPAIR",
-            "confidence": 0.99,
             "analytical_evidence": {
-                "confidence": 0.99,
                 "violated_constraints": ["Return the value of 6 * 7."],
                 "evidence": ["The worker returned 41 without executed evidence."],
                 "suspected_step_ids": [1]
@@ -71,7 +69,7 @@ manager_responses = [
                     "name": "final_result", "version": "S1", "value": 42
                 }],
                 "conclusions": ["The result is 42."],
-                "traced_step_ids": [2]
+                "source_interval": {"start": 2, "end": 2}
             }
         }
     ),
@@ -88,7 +86,6 @@ manager_responses = [
     outer_final(
         {
             "action": "COMMIT_STATE",
-            "confidence": 0.99
         }
     ),
 ]

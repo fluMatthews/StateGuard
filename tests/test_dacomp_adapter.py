@@ -15,6 +15,8 @@ from stateguard.adapters.dacomp.worker_de import (
     NativeCodeActStep,
 )
 from stateguard.adapters.dacomp.workflow import DACompWorkflow
+
+OFFICIAL_DACOMP_ROOT = Path("/fs/fast/u2024201619/DAComp-main")
 from stateguard.core.events import ReActStep
 from stateguard.core.models import AgentAction, Message, ToolResult
 from stateguard.state.draft import (
@@ -198,10 +200,9 @@ class DACompAdapterTests(unittest.TestCase):
     def test_workflow_is_pause_cadence_not_boundary_and_has_no_hint(self):
         workflow = DACompWorkflow(5)
         lifecycle = workflow.lifecycle_prompt()
-        self.assertIn("Pause after every 5 accepted native Worker actions", lifecycle)
-        self.assertIn("STATE-FORMATION DECISION", lifecycle)
-        self.assertIn("A plan, navigation step, repeated inspection", lifecycle)
-        self.assertIn("uncertain, RESUME_WORKER", lifecycle)
+        self.assertIn("Pause every 5 accepted official Worker action steps", lifecycle)
+        self.assertIn("PENDING AND STATE FORMATION", lifecycle)
+        self.assertIn("Otherwise ABSTAIN", lifecycle)
         self.assertNotIn("{{REVIEW_CADENCE}}", lifecycle)
         step = ReActStep(
             5,
@@ -302,6 +303,9 @@ class DACompAdapterTests(unittest.TestCase):
             (task_dir / "config" / "layer_dependencies.yaml").write_text("layers: {}\n")
             (task_dir / "question.md").write_text("Add a metric.\n")
             (task_dir / "run.py").write_text("print('ok')\n")
+            # The DE instruction is built by the benchmark's own create_de_task_prompt,
+            # so the synthetic root exposes the official methods tree it lives in.
+            (root / "methods").symlink_to(OFFICIAL_DACOMP_ROOT / "methods")
             workers = []
 
             def factory(task, workspace):

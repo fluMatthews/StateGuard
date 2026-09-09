@@ -14,6 +14,7 @@ from stateguard.core.models import AgentAction, Message, ToolResult
 from stateguard.state.draft import (
     RelationFinalization,
     RelationFinalizationMode,
+    SourceInterval,
     StateDraft,
     StateHeader,
 )
@@ -117,7 +118,7 @@ class DABstepAdapterTests(unittest.TestCase):
     def test_workflow_uses_three_step_pause_no_hint_and_posthoc_relations(self):
         workflow = DABstepWorkflow()
         lifecycle = workflow.lifecycle_prompt()
-        self.assertIn("every 3 official Worker code-action steps", lifecycle)
+        self.assertIn("every 3 accepted official Worker action steps", lifecycle)
         self.assertIn("not a state boundary", lifecycle)
         self.assertIn("relations posthoc", lifecycle)
         step = ReActStep(
@@ -140,7 +141,7 @@ class DABstepAdapterTests(unittest.TestCase):
             )
         draft = StateDraft(StateHeader("S2", (Constraint("query"),), ()))
         draft.issue = "computed total"
-        draft.traced_step_ids = [1, 2]
+        draft.source_interval = SourceInterval(1, 2)
         workflow.validate_relation_finalization(
             draft=draft,
             finalization=RelationFinalization(

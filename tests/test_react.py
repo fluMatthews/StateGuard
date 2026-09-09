@@ -1,6 +1,7 @@
 import json
 import unittest
 
+from stateguard.agents.react import parse_action
 from stateguard.agents.worker import WorkerAgent
 from stateguard.core.models import ToolResult
 from stateguard.providers.base import ScriptedModelClient
@@ -42,6 +43,16 @@ class ReActAgentTest(unittest.TestCase):
         self.assertEqual(workspace.variables["result"], 42)
         self.assertTrue(second.done)
         self.assertEqual(worker.final_answer, "42")
+
+
+    def test_control_action_is_distinct_from_worker_final(self):
+        action = parse_action(json.dumps({
+            "type": "control",
+            "reasoning": "The lifecycle decision is supported.",
+            "answer": {"action": "RESUME_WORKER"},
+        }))
+        self.assertEqual(action.kind, "control")
+        self.assertEqual(json.loads(action.answer)["action"], "RESUME_WORKER")
 
 
 if __name__ == "__main__":

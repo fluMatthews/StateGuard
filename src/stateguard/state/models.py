@@ -8,6 +8,9 @@ from typing import Any, Iterable
 from stateguard.core.models import to_jsonable
 
 
+CURRENT_STATE_VERSION = "$CURRENT_STATE"
+
+
 class StateRelationType(str, Enum):
     INIT = "init"
     PROGRESS = "progress"
@@ -26,7 +29,12 @@ class Constraint:
             raise ValueError("constraint text must be non-empty")
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> "Constraint":
+    def from_dict(cls, value: Any) -> "Constraint":
+        # A bare string is accepted as the constraint text, mirroring
+        # Conclusion.from_value. Managers routinely write a plain list of
+        # strings, and indexing one raised an unactionable TypeError.
+        if not isinstance(value, dict):
+            return cls(text=str(value))
         return cls(
             text=str(value["text"]),
             # ``executable_predicate`` is accepted only when reading an older
@@ -42,6 +50,59 @@ class Constraint:
         return value
 
 
+# What a Worker cannot cheaply rediscover is worth sending back to it; what it
+# can is noise. Across every DE state written so far the split is clean and
+# mechanical: two thirds of the variables are inventories of table or file
+# names -- staging_files_written, marts, *_model_list -- which the Worker
+# produced itself and can list with one shell command. The remainder is what
+# it paid many steps to learn, and would have to pay again: that a source
+# table holds admin_id in the team_id column, that a conversation_id column
+# carries timestamps, that an email filter cut 3,004 rows down to 7.
+#
+# An inventory is recognizable without knowing any of that. Split on commas
+# and every piece is a bare identifier -- letters, digits, underscores, dots.
+# A finding never is: "email (lower(trim(property_email)) not null)" and
+# "admin_id = id (3004 rows; ...)" carry spaces, parentheses, equals signs.
+# The test is on the rendered shape rather than the Python type because the
+# same inventories arrive both ways, half as lists and half as comma-joined
+# strings. Requiring every piece to be bare, not most, is what keeps
+# raw_schema -- a sentence followed by a column list -- on the useful side.
+#
+# 500 characters clears the longest finding seen (466: a note that the source
+# column order departs from the contract, with the mapping it rebuilt).
+# Scalars and booleans always survive: nothing distinguishes a bare
+# marts_written=true from job_application_duplication=true except meaning, and
+# four characters is not worth the risk of dropping the warning.
+_HINT_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_HINT_VALUE_CHARS = 500
+
+
+def _is_inventory(value: Any) -> bool:
+    """True when the value is only a list of names."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return False
+    pieces = value if isinstance(value, list) else str(value).split(",")
+    cleaned = [str(piece).strip().strip("'\"") for piece in pieces]
+    cleaned = [piece for piece in cleaned if piece]
+    if len(cleaned) < 3:
+        return False
+    return all(_HINT_IDENTIFIER.match(piece) for piece in cleaned)
+
+
+def _hint_variable(variable: "VariableRef") -> dict[str, Any] | None:
+    if _is_inventory(variable.value):
+        return None
+    value = variable.value
+    if not isinstance(value, (bool, int, float)) and value is not None:
+        rendered = value if isinstance(value, str) else to_jsonable(value)
+        text = rendered if isinstance(rendered, str) else str(rendered)
+        if len(text) > _HINT_VALUE_CHARS:
+            value = f"{text[:_HINT_VALUE_CHARS]}…"
+        else:
+            value = rendered
+    return {"name": variable.name, "value": value}
+
+
 @dataclass(frozen=True)
 class VariableRef:
     name: str
@@ -51,8 +112,9 @@ class VariableRef:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ValueError("variable requires a non-empty name")
-        if not isinstance(self.version, str) or not re.fullmatch(
-            r"S[1-9][0-9]*", self.version
+        if not isinstance(self.version, str) or (
+            self.version != CURRENT_STATE_VERSION
+            and not re.fullmatch(r"S[1-9][0-9]*", self.version)
         ):
             raise ValueError("variable version must be the producing state ID, e.g. S3")
 
@@ -62,7 +124,9 @@ class VariableRef:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "VariableRef":
-        raw_version = str(value["version"]).strip()
+        # The Manager writes content; the harness owns the current draft ID and
+        # attaches that version mechanically when this update is applied.
+        raw_version = str(value.get("version", CURRENT_STATE_VERSION)).strip()
         return cls(
             name=str(value["name"]),
             version=raw_version,
@@ -224,9 +288,9 @@ class AnalyticalState:
             metadata=dict(value.get("metadata", {})),
         )
 
-    def as_state_hint(self) -> dict[str, Any]:
+    def as_state_hint(self, include_variables: bool = False) -> dict[str, Any]:
         """Minimal related-state observation injected into the worker."""
-        return {
+        hint: dict[str, Any] = {
             "id": self.id,
             "issue": self.issue,
             "conclusions": [item.claim for item in self.conclusions],
@@ -235,3 +299,12 @@ class AnalyticalState:
                 for item in self.relations
             ],
         }
+        if include_variables:
+            kept = [
+                entry
+                for entry in (_hint_variable(item) for item in self.used_variables)
+                if entry is not None
+            ]
+            if kept:
+                hint["variables"] = kept
+        return hint

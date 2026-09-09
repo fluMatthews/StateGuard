@@ -69,6 +69,23 @@ class TraceBuffer:
             raise ValueError(f"duplicate worker step id: {step.step_id}")
         self.records.append(TraceRecord(step, repair_attempt))
 
+    def replace_pending_step(self, step: ReActStep) -> None:
+        """Swap one pending step for a shortened rewrite of itself.
+
+        Only the newest pending step is ever rewritten, and only when a review
+        still overflows with nothing left to drop. The replacement is permanent:
+        the step keeps its shortened form for every later review, so the Manager
+        never sees one step in two shapes and a replay reproduces the same view.
+        """
+        for record in self.records:
+            if record.step.step_id != step.step_id:
+                continue
+            if record.status is not TraceStatus.PENDING:
+                raise ValueError(f"worker step {step.step_id} is not pending")
+            record.step = step
+            return
+        raise KeyError(f"unknown worker step id: {step.step_id}")
+
     def get(self, step_id: int) -> TraceRecord:
         """Read one exact worker step without exposing mutable trace state."""
         for record in self.records:
@@ -84,12 +101,11 @@ class TraceBuffer:
     ) -> tuple[int, ...]:
         """Validate a Manager trace selection and return deliberately omitted IDs.
 
-        A normal state closes a contiguous prefix of the pending interval.  Once
-        the current state has entered repair, the Manager may instead select an
-        ordered subset of the rewritten interval: the largest selected step
-        closes that interval prefix and unselected steps inside it are excluded
-        from the state.  Pending steps after that boundary remain available for
-        a later state.
+        Trace IDs are harness-owned. Multi-turn flow binds the full pending turn.
+        Single-query flow translates the Manager's coarse source_interval into an
+        ordered internal selection; allow_sparse lets an interval begin after the
+        pending prefix, which is then marked passed. Pending steps after the
+        interval end remain available for a later state.
         """
         pending_in_order = [
             record.step.step_id
@@ -108,8 +124,8 @@ class TraceBuffer:
             expected_prefix = pending_in_order[: len(selected_list)]
             if selected_list != expected_prefix:
                 raise ValueError(
-                    "a state interval must be a contiguous prefix beginning at the "
-                    f"candidate start; expected {expected_prefix}, got {selected_list}"
+                    "the harness-owned full-turn selection must be the pending prefix; "
+                    f"expected {expected_prefix}, got {selected_list}"
                 )
             return ()
 
@@ -118,7 +134,7 @@ class TraceBuffer:
         positions = {step_id: index for index, step_id in enumerate(pending_in_order)}
         if selected_list != sorted(selected_list, key=positions.__getitem__):
             raise ValueError(
-                "a repaired state must trace worker steps in execution order; "
+                "a source interval must bind worker steps in execution order; "
                 f"got {selected_list}"
             )
         closed_prefix = pending_in_order[: positions[selected_list[-1]] + 1]
@@ -164,6 +180,43 @@ class TraceBuffer:
                 record.status = TraceStatus.REJECTED
                 rejected.append(record.step.step_id)
         return tuple(rejected)
+
+    def reject_uncommitted(self) -> tuple[int, ...]:
+        """Reject the complete live branch while preserving attempt provenance.
+
+        Pending tail steps can become the input to a later state after an earlier
+        repaired state commits. Their recorded repair-attempt number therefore need
+        not match the later state's local repair counter. Status, rather than that
+        historical number, identifies the live branch that must be rewritten.
+        """
+        rejected: list[int] = []
+        for record in self.records:
+            if record.status in {TraceStatus.PENDING, TraceStatus.DRAFTED}:
+                record.status = TraceStatus.REJECTED
+                rejected.append(record.step.step_id)
+        return tuple(rejected)
+
+    def drop_oldest_pending(self, keep: int) -> tuple[int, ...]:
+        """Pass the oldest pending steps, keeping the newest ``keep`` of them.
+
+        A single-query unit never resets its pending trace, so an observation the
+        model refuses for length only grows: the failure leaves pending intact and
+        the next pause carries the same steps plus more. Passing the oldest ones
+        keeps the newest steps whole -- a step is the atomic unit the Manager
+        reasons about, so half a step is worse than none -- and lets the run
+        continue. Dropped steps are marked PASSED: they left the observation, so a
+        later state must not claim them as evidence.
+        """
+        if keep < 0:
+            raise ValueError("keep must be non-negative")
+        pending = [r for r in self.records if r.status is TraceStatus.PENDING]
+        if len(pending) <= keep:
+            return ()
+        dropped: list[int] = []
+        for record in pending[: len(pending) - keep]:
+            record.status = TraceStatus.PASSED
+            dropped.append(record.step.step_id)
+        return tuple(dropped)
 
     def pass_uncommitted(self) -> tuple[int, ...]:
         passed: list[int] = []

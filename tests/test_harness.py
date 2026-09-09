@@ -28,12 +28,14 @@ from stateguard.state.draft import (
     DraftStore,
     RelationFinalization,
     RelationFinalizationMode,
+    SourceInterval,
     StateHeader,
     StateUpdate,
 )
 from stateguard.state.graph import StateRelationGraph
 from stateguard.state.models import AnalyticalState
 from stateguard.state.store import StateStore
+from stateguard.telemetry.artifacts import RunArtifactWriter
 from stateguard.validation.models import (
     AnalyticalEvidence,
     ERROR_HINT_PROMPT,
@@ -63,9 +65,7 @@ class RepairThenCommitManager:
             ),
             ManagerDecision(
                 action=ManagerAction.REPAIR,
-                confidence=0.99,
                 evidence=AnalyticalEvidence(
-                    confidence=0.99,
                     violated_constraints=("Return the executed value of 6 * 7.",),
                     evidence=("The worker answered 41 without an execution result.",),
                     suspected_step_ids=(1,),
@@ -98,7 +98,6 @@ class RepairThenCommitManager:
                     conclusions=(
                         Conclusion("The result is 42."),
                     ),
-                    traced_step_ids=(request.worker_step.step_id,),
                 ),
             )
         if not self.relations_finalized:
@@ -113,7 +112,6 @@ class RepairThenCommitManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            confidence=0.99,
         )
 
 
@@ -157,9 +155,7 @@ class SparseRepairThenCommitManager:
         if index == 3:
             return ManagerDecision(
                 action=ManagerAction.REPAIR,
-                confidence=0.99,
                 evidence=AnalyticalEvidence(
-                    confidence=0.99,
                     violated_constraints=("Use only correct rewritten evidence.",),
                     evidence=("The first answer is explicitly unsupported.",),
                     suspected_step_ids=(1,),
@@ -175,9 +171,7 @@ class SparseRepairThenCommitManager:
                 action=ManagerAction.UPDATE_STATE,
                 state_update=StateUpdate(
                     conclusions=(Conclusion("The rewritten result is supported."),),
-                    # Step 3 is an irrelevant intermediate action inside the
-                    # repaired interval and is deliberately excluded.
-                    traced_step_ids=(2, 4, 5),
+                    source_interval=SourceInterval(1, 5),
                 ),
             )
         if index == 5:
@@ -234,7 +228,6 @@ class RelationFirstManager:
                 action=ManagerAction.UPDATE_STATE,
                 state_update=StateUpdate(
                     conclusions=(Conclusion("The reported value is 42."),),
-                    traced_step_ids=(1,),
                 ),
             )
         if len(self.observations) == 4:
@@ -248,7 +241,6 @@ class RelationFirstManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            confidence=0.95,
         )
 
 
@@ -283,13 +275,11 @@ class RelationReselectManager:
                 action=ManagerAction.UPDATE_STATE,
                 state_update=StateUpdate(
                     conclusions=(Conclusion("The worker actually reused S2."),),
-                    traced_step_ids=(1,),
                 ),
             )
         if index == 4:
             return ManagerDecision(
                 action=ManagerAction.FINALIZE_RELATIONS,
-                confidence=0.97,
                 relation_finalization=RelationFinalization(
                     mode=RelationFinalizationMode.RESELECT,
                     relations=(StateRelation(StateRelationType.PROGRESS, "S2"),),
@@ -333,9 +323,7 @@ class FixedRepairSequenceManager:
         if index in {3, 4, 5}:
             return ManagerDecision(
                 action=ManagerAction.REPAIR,
-                confidence=0.99,
                 evidence=AnalyticalEvidence(
-                    0.99,
                     ("The answer must be verified.",),
                     (f"worker retry {index - 3} is explicitly marked unsupported",),
                     suspected_step_ids=(1,),
@@ -379,7 +367,7 @@ class FixedWindowManager:
                 state_update=StateUpdate(
                     issue="Complete the five-step segment",
                     conclusions=(Conclusion("The five-step segment completed."),),
-                    traced_step_ids=(1, 2, 3, 4, 5),
+                    source_interval=SourceInterval(1, 5),
                 ),
             )
         if len(self.observations) == 4:
@@ -393,7 +381,6 @@ class FixedWindowManager:
             )
         return ManagerDecision(
             action=ManagerAction.COMMIT_STATE,
-            confidence=0.95,
         )
 
 
@@ -428,7 +415,7 @@ class ArbitraryBoundaryManager:
                 state_update=StateUpdate(
                     issue="Record the first completed sub-result",
                     conclusions=(Conclusion("The first sub-result is complete."),),
-                    traced_step_ids=(1, 2, 3),
+                    source_interval=SourceInterval(2, 3),
                 ),
             )
         if index == 4:
@@ -593,15 +580,35 @@ class HarnessTest(unittest.TestCase):
             )
         )
         manager = StateManagerAgent(
-            ScriptedModelClient(["not-json-once", "not-json-twice"])
+            ScriptedModelClient([
+                "not-json-once",
+                "not-json-twice",
+                json.dumps({
+                    "type": "control",
+                    "reasoning": "The failed intervention is skipped.",
+                    "answer": {"action": "ABSTAIN"},
+                }),
+            ])
         )
         workspace = CountingWorkspace()
 
-        result = StateGuardHarness(
-            worker=worker,
-            manager=manager,
-            workspace=workspace,
-        ).run(TaskSpec("malformed-manager", "Let the worker answer."))
+        with tempfile.TemporaryDirectory() as directory:
+            writer = RunArtifactWriter(Path(directory))
+            result = StateGuardHarness(
+                worker=worker,
+                manager=manager,
+                workspace=workspace,
+                artifacts=writer,
+            ).run(TaskSpec("malformed-manager", "Let the worker answer."))
+
+            raw_path = Path(directory) / "manager_raw.jsonl"
+            self.assertTrue(raw_path.exists())
+            raw = json.loads(raw_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(raw["failure"]["error_type"], "ActionParseError")
+            self.assertTrue(raw["session"]["messages"])
+            self.assertTrue(
+                writer.events["manager_raw"][-1]["session"]["messages"]
+            )
 
         self.assertEqual(result.final_answer, "worker-answer")
         self.assertTrue(result.degraded)
@@ -703,8 +710,7 @@ class HarnessTest(unittest.TestCase):
                     action=ManagerAction.UPDATE_STATE,
                     state_update=StateUpdate(
                         conclusions=(Conclusion("The worker finished."),),
-                        traced_step_ids=(1,),
-                    ),
+                        ),
                 ),
             ]
         )
@@ -749,8 +755,7 @@ class HarnessTest(unittest.TestCase):
                     action=ManagerAction.UPDATE_STATE,
                     state_update=StateUpdate(
                         conclusions=(Conclusion("The worker finished."),),
-                        traced_step_ids=(1,),
-                    ),
+                        ),
                 ),
                 ManagerDecision(
                     action=ManagerAction.FINALIZE_RELATIONS,
@@ -855,7 +860,7 @@ class HarnessTest(unittest.TestCase):
                 )
             )
 
-        with self.assertRaisesRegex(ValueError, "contiguous prefix"):
+        with self.assertRaisesRegex(ValueError, "pending prefix"):
             trace.consume((1, 3), allow_sparse=False)
 
         self.assertEqual(
@@ -863,7 +868,7 @@ class HarnessTest(unittest.TestCase):
             ["pending", "pending", "pending"],
         )
 
-    def test_post_repair_state_can_commit_ordered_sparse_trace_subset(self):
+    def test_post_repair_state_uses_one_expanded_source_interval(self):
         model = ScriptedModelClient(
             [
                 json.dumps(
@@ -917,11 +922,11 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(result.final_answer, "supported")
         self.assertEqual(result.repair_count, 1)
         self.assertEqual(len(result.committed_states), 1)
-        self.assertEqual(result.committed_states[0].source_step_start, 2)
+        self.assertEqual(result.committed_states[0].source_step_start, 1)
         self.assertEqual(result.committed_states[0].source_step_end, 5)
         self.assertEqual(
             [record["status"] for record in harness.trace_buffer.history()],
-            ["rejected", "accepted", "passed", "accepted", "accepted"],
+            ["rejected", "accepted", "accepted", "accepted", "accepted"],
         )
         self.assertFalse(result.degraded)
 
@@ -999,28 +1004,25 @@ class HarnessTest(unittest.TestCase):
         self.assertTrue(any(message.content == "Now use it for the second analysis." for message in second_prompt))
         self.assertTrue(any('"answer": "first"' in message.content for message in second_prompt))
 
-    def test_low_confidence_repair_is_rejected(self):
+    def test_repair_requires_explicit_violated_constraint(self):
         with self.assertRaises(ValueError):
             ManagerDecision(
                 action=ManagerAction.REPAIR,
-                confidence=0.4,
-                evidence=AnalyticalEvidence(0.4, ("maybe",), ("weak",)),
-                error_hint=ErrorHint(ERROR_HINT_PROMPT, ("x",), "Might be wrong."),
+                evidence=AnalyticalEvidence(
+                    violated_constraints=(),
+                    evidence=("The result looks weak.",),
+                ),
+                error_hint=ErrorHint(
+                    ERROR_HINT_PROMPT, ("x",), "The result lacks concrete support."
+                ),
             )
 
-    def test_longds_reselection_requires_high_confidence_conflict(self):
+    def test_longds_reselection_requires_explicit_conflict(self):
         with self.assertRaises(ValueError):
-            ManagerDecision(
-                action=ManagerAction.FINALIZE_RELATIONS,
-                confidence=0.7,
-                relation_finalization=RelationFinalization(
-                    mode=RelationFinalizationMode.RESELECT,
-                    relations=(StateRelation(StateRelationType.BRANCH, "S2"),),
-                    reason="Select again from current state and the compact index.",
-                    conflict_evidence=(
-                        "The current state uses S2 output but the provisional state was S1.",
-                    ),
-                ),
+            RelationFinalization(
+                mode=RelationFinalizationMode.RESELECT,
+                relations=(StateRelation(StateRelationType.BRANCH, "S2"),),
+                conflict_evidence=(),
             )
 
     def test_heavy_repair_preserves_context_and_removes_only_variables(self):
@@ -1035,9 +1037,7 @@ class HarnessTest(unittest.TestCase):
         original = checkpoints.capture("original")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            confidence=0.99,
             evidence=AnalyticalEvidence(
-                0.99,
                 ("Only validated variables may be reused.",),
                 ("dirty was created on the rejected branch",),
             ),
@@ -1069,16 +1069,14 @@ class HarnessTest(unittest.TestCase):
         current = checkpoints.capture("current")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            confidence=0.99,
             evidence=AnalyticalEvidence(
-                0.99,
                 ("The calculation must use executed evidence.",),
                 ("The current result has no execution observation.",),
             ),
             error_hint=ErrorHint(
                 ERROR_HINT_PROMPT,
-                ("result",),
-                "The result is unsupported by an execution observation.",
+                ("keep_for_light",),
+                "keep_for_light is unsupported by an execution observation.",
             ),
             cleanup=CleanupPlan(remove_variables=("keep_for_light",)),
         )
@@ -1113,9 +1111,7 @@ class HarnessTest(unittest.TestCase):
         current = checkpoints.capture("current")
         decision = ManagerDecision(
             action=ManagerAction.REPAIR,
-            confidence=0.99,
             evidence=AnalyticalEvidence(
-                0.99,
                 ("The current state must use executed evidence.",),
                 ("The current state has no execution result.",),
             ),
@@ -1316,9 +1312,9 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(len(manager.observations), 5)
         self.assertEqual(manager.observations[1].event_type, "STEP_WINDOW")
         self.assertEqual(len(manager.observations[1].untraced_steps), 5)
-        self.assertEqual(
-            manager.observations[1].flow_policy["relation_timing"],
-            "segment_complete",
+        self.assertNotIn(
+            "flow_policy",
+            manager.observations[1].to_dict(),
         )
         self.assertNotIn(
             "<analytical_state_hint>",
@@ -1359,37 +1355,41 @@ class HarnessTest(unittest.TestCase):
         )
         manager = ArbitraryBoundaryManager()
 
-        result = StateGuardHarness(
+        harness = StateGuardHarness(
             worker=worker,
             manager=manager,
             workspace=InMemoryWorkspace(),
             flow_adapter=FixedStepFlowAdapter(window_size=5),
-        ).run(TaskSpec("arbitrary-window", "Complete a multi-stage analysis."))
+        )
+        result = harness.run(
+            TaskSpec("arbitrary-window", "Complete a multi-stage analysis.")
+        )
 
         state = result.committed_states[-1]
-        self.assertEqual((state.source_step_start, state.source_step_end), (1, 3))
+        self.assertEqual((state.source_step_start, state.source_step_end), (2, 3))
         self.assertEqual(
             (
-                manager.observations[1].candidate_start_step,
-                manager.observations[1].candidate_end_step,
+                manager.observations[1].pending_start_step,
+                manager.observations[1].pending_end_step,
             ),
             (1, 5),
         )
         self.assertEqual(
             (
-                manager.observations[5].candidate_start_step,
-                manager.observations[5].candidate_end_step,
+                manager.observations[5].pending_start_step,
+                manager.observations[5].pending_end_step,
             ),
             (4, 5),
         )
         self.assertEqual(
             (
-                manager.observations[-1].candidate_start_step,
-                manager.observations[-1].candidate_end_step,
+                manager.observations[-1].pending_start_step,
+                manager.observations[-1].pending_end_step,
             ),
             (4, 6),
         )
         self.assertEqual(result.final_answer, "done")
+        self.assertEqual(harness.trace_buffer.history()[0]["status"], "passed")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ def test_file_handshake_accepts_raw_action(tmp_path) -> None:
             tmp_path,
             1,
             {
-                "type": "final",
+                "type": "control",
                 "reasoning": "safe to continue",
                 "answer": {"action": "RESUME_WORKER"},
             },
@@ -60,7 +60,7 @@ def test_file_handshake_waits_for_partial_response_to_finish(tmp_path) -> None:
             tmp_path,
             1,
             {
-                "type": "final",
+                "type": "control",
                 "reasoning": "safe to continue",
                 "answer": {"action": "RESUME_WORKER"},
             },

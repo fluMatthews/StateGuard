@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manager-url", default="http://localhost:5000")
     parser.add_argument("--max-steps", type=int, default=40)
     parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--worker-max-tokens", type=int, default=None)
+    parser.add_argument("--worker-timeout", type=float, default=None)
+    parser.add_argument("--worker-max-retries", type=int, default=None)
     parser.add_argument("--task-concurrency", type=int, default=1)
     parser.add_argument("--reset_env_times", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -62,6 +65,9 @@ def main() -> int:
         api_key=args.api_key,
         base_url=args.base_url,
         max_model_len=args.max_model_len,
+        worker_max_tokens=getattr(args, "worker_max_tokens", None),
+        worker_timeout=args.worker_timeout,
+        worker_max_retries=args.worker_max_retries,
         reset_env_times=args.reset_env_times,
     )
     tasks = adapter.load_tasks(
@@ -69,10 +75,6 @@ def main() -> int:
         task_limit=args.task_limit,
         turn_limit=args.turn_limit,
     )
-    # Resolve official factories once before starting worker threads. run_task
-    # still creates an independent runtime and environment for every task.
-    if task_concurrency > 1:
-        adapter._ensure_runtime_components()
 
     def run_one(index, task):
         print(f"PROGRESS >>> TASK {index}/{len(tasks)} : {task.task_key}", flush=True)

@@ -32,7 +32,17 @@ unless a successful tool result was returned. Do not invent tool outputs.
 
 
 class ActionParseError(ValueError):
-    pass
+    """Raised when a model response cannot be read as an action.
+
+    The response never reaches ``session.messages`` -- parsing happens before the
+    append, and a malformed action must not become part of the agent's context.
+    Carrying the text on the exception is therefore the only way a caller can
+    still record what the model actually emitted.
+    """
+
+    def __init__(self, message: str, raw_response: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_response = raw_response
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
@@ -55,9 +65,31 @@ def parse_json_object(text: str) -> dict[str, Any]:
     return value
 
 
+def _is_native_tool_call(value: dict[str, Any]) -> bool:
+    """True for a provider tool-call envelope that only lacks its action type."""
+    return (
+        isinstance(value.get("name"), str)
+        and bool(value["name"])
+        and isinstance(value.get("arguments"), dict)
+    )
+
+
 def parse_action(text: str) -> AgentAction:
     value = parse_json_object(text)
     kind = str(value.get("type", value.get("kind", ""))).lower()
+    if not kind and _is_native_tool_call(value):
+        # A reasoning model served with tool schemas sometimes answers with the
+        # provider's own call envelope -- {"name": ..., "arguments": {...}} --
+        # written into the message content rather than into tool_calls, where
+        # OpenAICompatibleClient would have converted it. The call is complete
+        # and unambiguous; only the "type" the text protocol asks for is
+        # missing, so reading it as a tool action loses nothing.
+        return AgentAction(
+            kind="tool",
+            reasoning=str(value.get("reasoning", "")),
+            tool_name=str(value["name"]),
+            arguments=value["arguments"],
+        )
     if kind == "tool":
         arguments = value.get("arguments", {})
         if not isinstance(arguments, dict):
@@ -74,6 +106,15 @@ def parse_action(text: str) -> AgentAction:
             answer = json.dumps(answer, ensure_ascii=False)
         return AgentAction(
             kind="final",
+            reasoning=str(value.get("reasoning", "")),
+            answer=answer,
+        )
+    if kind == "control":
+        answer = value.get("answer", "")
+        if not isinstance(answer, str):
+            answer = json.dumps(answer, ensure_ascii=False)
+        return AgentAction(
+            kind="control",
             reasoning=str(value.get("reasoning", "")),
             answer=answer,
         )
@@ -98,6 +139,10 @@ class ReActAgent:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.session = AgentSession()
+        # The server reports what a request actually cost and why generation
+        # stopped. Nothing kept it, so a truncated reply reached the harness as
+        # an unparseable string and its size had to be inferred from characters.
+        self.last_model_metadata: dict[str, Any] = {}
 
     @property
     def messages(self) -> tuple[Message, ...]:
@@ -150,10 +195,22 @@ class ReActAgent:
             raise RuntimeError(f"agent exceeded max_steps={self.max_steps}")
 
         response = self.model.complete(self._messages_for_model(), self.tools.schemas())
-        action = parse_action(response.content)
+        self.last_model_metadata = dict(response.metadata or {})
+        try:
+            action = parse_action(response.content)
+        except ActionParseError as exc:
+            # Attach the unparsed text so the harness can record it. The session
+            # itself stays clean: a malformed action must not enter the context.
+            if exc.raw_response is None:
+                exc.raw_response = response.content
+            raise
         self.session.step_count += 1
         self.session.messages.append(
-            Message("assistant", response.content, metadata={"reasoning": response.reasoning})
+            Message(
+                "assistant",
+                response.content,
+                metadata={"reasoning": response.reasoning, **self.last_model_metadata},
+            )
         )
 
         observation = None
@@ -215,4 +272,5 @@ class ReActAgent:
             "step_count": self.session.step_count,
             "done": self.done,
             "final_answer": self.final_answer,
+            "last_model_metadata": self.last_model_metadata,
         }

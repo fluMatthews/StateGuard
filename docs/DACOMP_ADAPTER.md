@@ -53,9 +53,10 @@ Both tracks literally share `DACompWorkflow`:
 3. Five steps are only a review cadence. The Manager first decides whether pending
    actions contain an important result. If not, it resumes and the pending interval
    continues accumulating.
-4. If a state exists, the Manager selects an arbitrary contiguous prefix starting at
-   `candidate_start_step`. After a repair, it may select the correct execution-ordered
-   subset of the rewritten interval. The endpoint need not be a multiple of five.
+4. If a state exists, the Manager writes one inclusive
+   `source_interval={start,end}`. Either boundary may be any observed pending step
+   and need not be a multiple of five. After repair, the start is preserved and
+   only the end may extend to cover the retry outcome.
 5. `OPEN_STATE` has no provisional relations and injects no state hint. Only an
    evidenced repair appends the fixed, non-solving error hint.
 6. After writing and checking the state body, the Manager selects relations from the

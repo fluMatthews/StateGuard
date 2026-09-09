@@ -1,20 +1,57 @@
 LONGDS TURN LIFECYCLE
 
-- One benchmark task contains sequential turns and uses one persistent Worker,
-  Manager, state store, conversation, and Python workspace.
-- At each turn initialization, read the current public query and use
-  load_state_index's compact id/issue/conclusions entries when needed. OPEN_STATE
-  before Worker execution with the query-defined issue, constraints, and provisional
-  exact related-state IDs.
-- Related-state hints are inserted before the first Worker generation. Resume the
-  Worker and do not inspect or interrupt inside the turn.
-- At TURN_END, inspect the complete pending turn trace. Rewrite current draft content
-  after every repair attempt, perform the shared evidence checks, and repair only on
-  clear supported error. Ambiguity passes. Before repair, trace the complete
-  contiguous turn. After repair, select only correct supporting steps from the
-  rewritten turn in execution order; the selection may be sparse but must close
-  through the accepted terminal step so no turn output remains pending.
-- Before commit, compare the completed current state with provisional related states.
-  Confirm by default; reselect from the compact index only on explicit conflict.
-- The shared repair schedule is independent for every state: two light repairs, then
-  one heavy repair. After each retry, inspect whether the error was repaired.
+SCOPE
+
+- One task contains sequential turns with one persistent Worker, Manager, store,
+  conversation, and workspace.
+- Every turn is exactly one state. There is no state-formation decision or
+  pending interval.
+
+TURN START: RELATIONS AND HEADER
+
+1. The harness supplies the compact committed-state index with the current query.
+   Compare their issue and conclusions; load only plausible exact states when
+   needed. Choose provisional relations, or init if none is suitable. Call load_state
+   ONLY when the compact committed-state index is not enough to settle the relation.
+2. OPEN_STATE before Worker execution with the query-defined issue, constraints,
+   and provisional relations.
+3. After OPEN_STATE succeeds, the harness injects related-state hints and starts
+   the Worker mechanically.
+
+TURN END: WRITE, CHECK, COMMIT
+
+1. Emit UPDATE_STATE from the completed turn. Do not select or enumerate Worker
+   steps: the harness binds the complete turn automatically. After repair,
+   rewrite the body from the full turn history and the retry outcome.
+2. After UPDATE_STATE succeeds, the harness supplies the compact index again.
+   This is the main stage for Tool actions: apply the shared checks, then emit REPAIR
+   on clear evidence or FINALIZE_RELATIONS otherwise.
+3. For FINALIZE_RELATIONS, load exact provisional relation states only when
+   needed. Confirm by default; reselect only on explicit conflict. Never use
+   select.
+4. After FINALIZE_RELATIONS succeeds, emit COMMIT_STATE. After a failed heavy
+   retry, emit ABANDON_STATE and continue to the next turn.
+
+[[FLOW_STATE_ACTIONS]]
+5.2 OPEN_STATE
+
+Open before Worker execution. The harness assigns id.
+
+{"type":"control","reasoning":"The turn requires its mandatory state header.","answer":{"action":"OPEN_STATE","state_header":{"issue":"Resolve the current turn query.","constraints":[{"text":"Follow the current query requirements."}],"relations":[{"type":"progress","related_state_id":"S2"}]}}}
+
+5.3 UPDATE_STATE
+
+Write the completed turn body. The harness assigns variable versions and binds
+the complete turn; do not include step IDs or source_interval.
+
+{"type":"control","reasoning":"The completed turn provides the state body.","answer":{"action":"UPDATE_STATE","state_update":{"used_variables":[{"name":"result","value":117}],"conclusions":["The turn produced the requested result."]}}}
+
+5.4 FINALIZE_RELATIONS
+
+Confirm provisional relations without repeating them:
+
+{"type":"control","reasoning":"The completed state supports its provisional relations.","answer":{"action":"FINALIZE_RELATIONS","relation_finalization":{"mode":"confirm"}}}
+
+Reselect only when conflict_evidence clearly contradicts the provisional links:
+
+{"type":"control","reasoning":"Concrete conflict evidence requires relation reselection.","answer":{"action":"FINALIZE_RELATIONS","relation_finalization":{"mode":"reselect","relations":[{"type":"init"}],"conflict_evidence":["The completed state uses no value or conclusion from S2."]}}}

@@ -7,7 +7,7 @@ from stateguard.agents.manager import StateManagerAgent
 from stateguard.core.events import ReActStep
 from stateguard.core.models import AgentAction, Message, TaskSpec, ToolResult
 from stateguard.harness.blind_view import BlindViewBuilder, assert_blind
-from stateguard.providers.base import ScriptedModelClient
+from stateguard.providers.base import ModelResponse, ScriptedModelClient
 from stateguard.runtime.evidence_tools import build_manager_evidence_tools
 from stateguard.runtime.executors import IsolatedProbeExecutor
 from stateguard.runtime.workspace import InMemoryWorkspace
@@ -20,6 +20,93 @@ from stateguard.validation.models import ManagerAction
 
 
 class ManagerAndBlindnessTest(unittest.TestCase):
+    def test_manager_retries_one_transport_error_without_polluting_session(self):
+        class FlakyModelClient:
+            def __init__(self, response):
+                self.response = response
+                self.calls = 0
+
+            def complete(self, messages, tools):
+                del messages, tools
+                self.calls += 1
+                if self.calls == 1:
+                    raise TimeoutError("temporary read timeout")
+                return ModelResponse(self.response)
+
+        decision = {
+            "action": "OPEN_STATE",
+            "state_header": {
+                "id": "S1",
+                "issue": "Record the result",
+                "constraints": [{"text": "Use checked evidence."}],
+                "relations": [{"type": "init"}],
+            },
+        }
+        model = FlakyModelClient(
+            json.dumps({"type": "control", "answer": decision})
+        )
+        manager = StateManagerAgent(model)
+        task = TaskSpec("transport-retry", "Record the result.")
+        manager.start_task(task)
+        request = BlindViewBuilder().build(
+            task=task,
+            event_type="TASK_START",
+            flow_policy={"mode": "turn", "relation_timing": "query_first"},
+            available_state_id="S1",
+            worker_step=None,
+            untraced_steps=(),
+            current_draft=None,
+            workspace_manifest={},
+            repair_attempts=0,
+        )
+
+        result = manager.act(request)
+
+        self.assertEqual(result.action, ManagerAction.OPEN_STATE)
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(len(manager.invocations), 2)
+        self.assertTrue(manager.invocations[0]["will_retry"])
+        self.assertIn("transport_error", manager.invocations[0])
+        self.assertIn("command", manager.invocations[1])
+        self.assertFalse(
+            any("manager_transport_error" in message.content for message in manager.messages)
+        )
+
+    def test_manager_fails_after_second_transport_error(self):
+        class FailingModelClient:
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, messages, tools):
+                del messages, tools
+                self.calls += 1
+                raise TimeoutError("persistent read timeout")
+
+        model = FailingModelClient()
+        manager = StateManagerAgent(model)
+        task = TaskSpec("transport-failure", "Record the result.")
+        manager.start_task(task)
+        request = BlindViewBuilder().build(
+            task=task,
+            event_type="TASK_START",
+            flow_policy={"mode": "turn", "relation_timing": "query_first"},
+            available_state_id="S1",
+            worker_step=None,
+            untraced_steps=(),
+            current_draft=None,
+            workspace_manifest={},
+            repair_attempts=0,
+        )
+
+        with self.assertRaises(TimeoutError):
+            manager.act(request)
+
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(len(manager.invocations), 3)
+        self.assertTrue(manager.invocations[0]["will_retry"])
+        self.assertFalse(manager.invocations[1]["will_retry"])
+        self.assertIn("runtime_error", manager.invocations[2])
+
     def test_manager_session_persists_across_task_units(self):
         manager = StateManagerAgent(ScriptedModelClient([]))
         manager.start_task(TaskSpec("turn-1", "First turn."))
@@ -43,7 +130,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         self.assertIn("inspect_python", tool_names)
         self.assertIn("check_execution", tool_names)
         self.assertIn("run_probe", tool_names)
-        self.assertIn("load_state_index", tool_names)
+        self.assertNotIn("load_state_index", tool_names)
         self.assertIn("load_state", tool_names)
         self.assertIs(runtime.manager, manager)
 
@@ -121,6 +208,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         )
 
         executed = tools.execute("check_execution", {"step_id": 1})
+        executed_from_string = tools.execute("check_execution", {"step_id": "1"})
         claimed_only = tools.execute("check_execution", {"step_id": 2})
         native_bash = tools.execute("check_execution", {"step_id": 3})
         native_final = tools.execute("check_execution", {"step_id": 4})
@@ -128,6 +216,8 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         self.assertTrue(executed.ok)
         self.assertEqual(executed.data["status"], "succeeded")
         self.assertTrue(executed.data["execution_succeeded"])
+        self.assertTrue(executed_from_string.ok)
+        self.assertEqual(executed_from_string.data, executed.data)
         self.assertTrue(claimed_only.ok)
         self.assertEqual(claimed_only.data["status"], "not_executed")
         self.assertFalse(claimed_only.data["execution_succeeded"])
@@ -173,7 +263,6 @@ class ManagerAndBlindnessTest(unittest.TestCase):
     def test_react_manager_returns_open_state_command(self):
         decision = {
             "action": "OPEN_STATE",
-            "confidence": 0.95,
             "state_header": {
                 "id": "S1",
                 "issue": "Return an executed result",
@@ -181,7 +270,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
                 "relations": [{"type": "init"}],
             },
         }
-        model_output = json.dumps({"type": "final", "answer": decision})
+        model_output = json.dumps({"type": "control", "answer": decision})
         manager = StateManagerAgent(ScriptedModelClient([model_output]))
         task = TaskSpec("t", "Return an executed result.")
         manager.start_task(task)
@@ -201,7 +290,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         self.assertEqual(result.state_header.id, "S1")
         self.assertEqual(len(manager.invocations), 1)
 
-    def test_manager_retries_one_malformed_protocol_response(self):
+    def test_manager_retries_one_legacy_final_protocol_response(self):
         decision = {
             "action": "OPEN_STATE",
             "state_header": {
@@ -214,8 +303,8 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         manager = StateManagerAgent(
             ScriptedModelClient(
                 [
-                    "this is not a JSON action",
                     json.dumps({"type": "final", "answer": decision}),
+                    json.dumps({"type": "control", "answer": decision}),
                 ]
             )
         )
@@ -294,7 +383,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
             workspace=InMemoryWorkspace(),
         )
         tool_names = {schema["name"] for schema in tools.schemas()}
-        self.assertIn("load_state_index", tool_names)
+        self.assertNotIn("load_state_index", tool_names)
         self.assertIn("load_state", tool_names)
         self.assertNotIn("trace_variable", tool_names)
         self.assertNotIn("list_state_index", tool_names)
@@ -303,14 +392,7 @@ class ManagerAndBlindnessTest(unittest.TestCase):
         self.assertNotIn("trace_relations", tool_names)
         self.assertNotIn("workspace_manifest", tool_names)
         self.assertNotIn("search_states", tool_names)
-        complete = tools.execute("load_state_index", {})
         exact = tools.execute("load_state", {"state_id": "S1"})
-        self.assertTrue(complete.ok)
-        self.assertEqual(complete.data["states"][0]["id"], "S1")
-        self.assertEqual(
-            set(complete.data["states"][0]),
-            {"id", "issue", "conclusions"},
-        )
         self.assertTrue(exact.ok)
         self.assertEqual(exact.data["id"], "S1")
 

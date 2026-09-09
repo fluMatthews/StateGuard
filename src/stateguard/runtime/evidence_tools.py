@@ -21,11 +21,6 @@ def build_manager_evidence_tools(
 ) -> ToolRegistry:
     """Create a read-only manager action space over committed evidence."""
 
-    def load_state_index() -> dict:
-        payload = {"states": state_store.load_state_index_json()}
-        assert_blind(payload)
-        return payload
-
     def load_state(state_id: str) -> dict:
         payload = state_store.load_state_json(state_id)
         assert_blind(payload)
@@ -33,14 +28,8 @@ def build_manager_evidence_tools(
 
     tools = [
         FunctionTool(
-            "load_state_index",
-            "Load the compact committed-state index (id, issue, conclusions) for relation selection. This is a read load, not search.",
-            load_state_index,
-            parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        ),
-        FunctionTool(
             "load_state",
-            "Load one exact committed-state JSON artifact by state ID for direct relation-state checking.",
+            "Load one exact committed-state JSON artifact by state ID in the compact committed-state index only for direct relation-state checking.",
             load_state,
             parameters={
                 "type": "object",
@@ -59,14 +48,19 @@ def build_manager_evidence_tools(
         ),
         FunctionTool(
             "inspect_python",
-            "Inspect Python syntax plus assigned and loaded variable names without executing it.",
+            "Inspect whether the real executed code or assigned/loaded variables are consistent with worker's stated intention.",
             _inspect_python,
             parameters=_python_code_parameters(),
         ),
     ]
     if trace_buffer is not None:
 
-        def check_execution(step_id: int) -> dict:
+        def check_execution(step_id: int | str) -> dict:
+            if isinstance(step_id, str):
+                stripped = step_id.strip()
+                if not stripped.isdecimal():
+                    raise ValueError("step_id must be an integer")
+                step_id = int(stripped)
             record = trace_buffer.get(step_id)
             step = record.step
             observation = step.observation
@@ -129,7 +123,7 @@ def build_manager_evidence_tools(
         tools.append(
             FunctionTool(
                 "check_execution",
-                "Report whether one exact Worker native tool action received its matching executor result and whether that result succeeded. This covers Python, Bash, SQL, IPython, file actions, and other benchmark tools; it reports execution facts, not analytical correctness.",
+                "Report whether one exact Worker native tool action received its matching real executed result. This covers Python, Bash, SQL, IPython, file actions, and other benchmark tools; it reports execution facts, not analytical correctness. Call it ONLY for a step you highly suspect, NOT for almost every step worker executed",
                 check_execution,
                 parameters={
                     "type": "object",
@@ -155,7 +149,7 @@ def build_manager_evidence_tools(
             FunctionTool(
                 "run_probe",
                 "Execute one code check in a fresh isolated scratch workspace. "
-                "Worker analytical variables are not copied. You can load real task "
+                "Worker analytical variables are not copied. You can load real partial task "
                 "data through data_files and just run an independent probe to check the code.",
                 run_probe,
                 parameters=_python_code_parameters(),

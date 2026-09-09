@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import copy
 import importlib
 import inspect
 import json
+import os
 import sys
 import threading
 import time
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from stateguard.core.models import Message
+from stateguard.runtime.workspace import safe_clone
 
 from .worker_de import NativeCodeActStep
 from .workspace import DACompWorkspace
@@ -21,6 +22,33 @@ from .workspace import DACompWorkspace
 class ControllerSessionSnapshot:
     state: Any
     started: bool
+
+
+def _step_reasoning(action: Any) -> str:
+    """Return the Worker's stated intent for one step, read-only.
+
+    OpenHands fills ``action.thought`` from the assistant message content. A
+    reasoning model that answers with a tool call leaves that content empty and
+    puts its text in ``reasoning_content``, which the tool-calling branch of
+    ``response_to_actions`` never reads -- so every DE step reached the Manager
+    with an empty reasoning while DA and DABstep steps carry theirs.
+
+    The whole response is already attached to the action as tool-call metadata,
+    so recovering the text here costs the Worker nothing: ``action.thought``
+    stays exactly as OpenHands set it, and that field alone is what feeds the
+    Worker's own conversation history.
+    """
+    thought = str(getattr(action, "thought", "") or "")
+    if thought:
+        return thought
+    response = getattr(getattr(action, "tool_call_metadata", None), "model_response", None)
+    try:
+        message = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    if not isinstance(message, dict):
+        message = getattr(message, "__dict__", {})
+    return str(message.get("reasoning_content") or "").strip()
 
 
 class OpenHandsStepwiseControllerSession:
@@ -69,9 +97,28 @@ class OpenHandsStepwiseControllerSession:
             raise RuntimeError("OpenHands controller session already started")
         self._load_official()
         I = self._imports
-        llm_config = I["get_llm_config_arg"](self.llm_config_name)
+        # Resolve the official config.toml from the benchmark root instead of the
+        # process working directory, which the official CLI happens to rely on.
+        config_toml = self.official_root / "methods" / "de-agent" / "config.toml"
+        llm_config = I["get_llm_config_arg"](self.llm_config_name, str(config_toml))
         if llm_config is None:
-            raise ValueError(f"unknown official OpenHands LLM config: {self.llm_config_name}")
+            raise ValueError(
+                f"unknown official OpenHands LLM config {self.llm_config_name!r} in {config_toml}"
+            )
+        # Credentials may be supplied through the environment so they never have to
+        # be written into the benchmark's tracked config file.
+        api_key = os.environ.get("WORKER_API_KEY")
+        if api_key:
+            # LLMConfig stores the key as a pydantic SecretStr.
+            secret_type = type(llm_config.api_key)
+            llm_config.api_key = (
+                secret_type(api_key)
+                if hasattr(llm_config.api_key, "get_secret_value")
+                else api_key
+            )
+        api_base = os.environ.get("WORKER_API_BASE")
+        if api_base:
+            llm_config.base_url = api_base
         sandbox = I["get_default_sandbox_config_for_eval"]()
         config = I["OpenHandsConfig"](
             default_agent=self.agent_class,
@@ -84,6 +131,13 @@ class OpenHandsStepwiseControllerSession:
         )
         config.set_llm_config(llm_config)
         agent_config = config.get_agent_config(self.agent_class)
+        # On a context overflow OpenHands would emit a CondensationRequestAction
+        # and carry on with a compressed history, which is itself a form of state
+        # management. Measuring what an external state manager adds requires a
+        # baseline that does not manage its own memory, so the overflow is
+        # surfaced instead and the run stops with the trajectory it has, matching
+        # how the DA worker behaves.
+        agent_config.enable_history_truncation = False
         agent_config.enable_prompt_extensions = False
         agent_config.enable_jupyter = False
         agent_config.enable_browsing = False
@@ -224,7 +278,7 @@ class OpenHandsStepwiseControllerSession:
                 raw_action="",
                 raw_observation=str(observation or content),
             )
-        thought = str(getattr(action, "thought", "") or "")
+        thought = _step_reasoning(action)
         raw_action = str(action)
         if isinstance(action, I["AgentFinishAction"]):
             outputs = getattr(action, "outputs", {}) or {}
@@ -271,14 +325,58 @@ class OpenHandsStepwiseControllerSession:
         )
         self._wait_initial_ready()
 
+    # OpenHands keeps live runtime handles on State. ``convo_stats`` owns a
+    # ``threading.Lock``, which deepcopy refuses, and it carries token/cost
+    # statistics rather than analytical state, so a rollback must not rewind it.
+    _SHARED_STATE_FIELDS = ("convo_stats",)
+    # Caches State rebuilds from history; ``State.__getstate__`` drops them too.
+    _DERIVED_STATE_FIELDS = ("_view", "_history_checksum")
+
+    @classmethod
+    def _clone_fields(cls, fields: dict[str, Any] | None) -> dict[str, Any] | None:
+        if fields is None:
+            return None
+        return {
+            name: value if name in cls._SHARED_STATE_FIELDS else safe_clone(value)
+            for name, value in fields.items()
+        }
+
+    @classmethod
+    def _state_fields(cls, state: Any) -> dict[str, Any] | None:
+        """Snapshot OpenHands State without going through its pickle hooks.
+
+        ``copy.deepcopy`` routes through ``State.__getstate__``, which empties
+        ``history`` because OpenHands rebuilds it from the event stream -- a
+        replay a StateGuard rollback never performs, so the restored Worker
+        would silently lose its conversation. That hook also drags in
+        ``convo_stats`` and its lock, which deepcopy cannot handle at all.
+        Reading the instance dict directly keeps the conversation, shares the
+        runtime statistics by identity, and drops the caches so they rebuild
+        from the restored history.
+        """
+        if state is None:
+            return None
+        return cls._clone_fields(
+            {
+                name: value
+                for name, value in vars(state).items()
+                if name not in cls._DERIVED_STATE_FIELDS
+            }
+        )
+
     def snapshot(self) -> ControllerSessionSnapshot:
         state = self.controller.get_state() if self.controller is not None else None
-        return ControllerSessionSnapshot(copy.deepcopy(state), self._started)
+        return ControllerSessionSnapshot(self._state_fields(state), self._started)
 
     def restore(self, snapshot: ControllerSessionSnapshot) -> None:
         if self.controller is None:
             raise RuntimeError("cannot restore an uninitialized OpenHands controller")
-        restored = copy.deepcopy(snapshot.state)
+        # Clone on the way out as well: one snapshot can be restored more than
+        # once -- the harness restores a checkpoint, then restores the
+        # pre-action state when a transaction fails -- so the stored fields
+        # must never be handed out by reference.
+        restored = object.__new__(type(self.controller.get_state()))
+        vars(restored).update(self._clone_fields(snapshot.state) or {})
         self.controller.state_tracker.state = restored
         self.controller.state = restored
         self.controller._pending_action = None

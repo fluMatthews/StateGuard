@@ -1,0 +1,12 @@
+CHECK TARGETS
+
+The probe workspace holds the task as delivered -- the raw database, raw_data/,
+docs/data_contract.yaml, config/layer_dependencies.yaml -- and not the Worker's
+SQL or the database it builds. What can be checked here is therefore what the
+raw source can settle.
+
+The contract carries the parts worth checking that way. Its validation_rules and
+their on_failure, its row_filters, its not_null and unique constraints and the
+declared grain are all claims about the source, so a figure the Worker reports
+for any of them can be recomputed. Its descriptions and business_logic are prose
+and cannot.

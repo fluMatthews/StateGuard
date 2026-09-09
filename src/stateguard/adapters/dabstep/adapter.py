@@ -13,6 +13,7 @@ from stateguard.runtime.trace import TraceBuffer
 from stateguard.telemetry.artifacts import RunArtifactWriter
 
 from .artifacts import write_config, write_json, write_task_artifacts
+from .anthropic import AnthropicMessagesModel
 from .dataset import DABstepDataset, DABstepTask
 from .evaluator import official_question_score
 from .executor import DABstepProbeExecutor
@@ -234,6 +235,15 @@ class DABstepAdapter:
             max_steps=self.max_worker_steps,
             context_dir=task.context_dir,
         )
+        if self.model_id.startswith("anthropic/"):
+            if not self.api_base or not self.api_key:
+                raise ValueError("Anthropic Worker requires api_base and api_key")
+            native_agent.model = AnthropicMessagesModel(
+                model_id=self.model_id,
+                api_base=self.api_base,
+                api_key=self.api_key,
+                max_tokens=3000,
+            )
         return DABstepWorkerAgent(
             task=task,
             native_agent=native_agent,
